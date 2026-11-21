@@ -1,0 +1,8 @@
+{
+  "name": "CueScript",
+  "description": "Video link transcription studio and engineering architecture blueprint for YouTube, Facebook, and Instagram with clickable timestamps, speaker labels, chapters, and subtitle exports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
