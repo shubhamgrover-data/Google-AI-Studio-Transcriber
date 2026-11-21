@@ -26,6 +26,10 @@ const INLINE_MEDIA_LIMIT_BYTES = 10 * 1024 * 1024; // 10 MB inline; larger uses 
 const GROQ_WHISPER_MODEL = 'whisper-large-v3';
 const GROQ_MAX_SINGLE_FILE_BYTES = 18 * 1024 * 1024; // Keep well under Groq 25 MB file limit
 const GROQ_CHUNK_DURATION_SECONDS = 900; // 15-minute chunks (~3.6 MB each at 32 kbps mono MP3)
+const DEEPGRAM_MODEL = 'nova-3';
+const DEEPGRAM_LISTEN_ENDPOINT = 'https://api.deepgram.com/v1/listen';
+const DEEPGRAM_MAX_SINGLE_FILE_BYTES = 30 * 1024 * 1024; // Stream directly up to 30 MB; chunk larger files
+const DEEPGRAM_CHUNK_DURATION_SECONDS = 1200; // 20-minute chunks for very large files
 const GEMINI_MODEL = 'gemini-4-hydrogen';
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'cuescript-yt-dlp');
 const YTDLP_DOWNLOAD_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
@@ -312,6 +316,14 @@ function getGroqClient(): Groq | null {
     return null;
   }
   return new Groq({ apiKey });
+}
+
+function getDeepgramApiKey(): string | null {
+  const apiKey = process.env.DEEPGRAM_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_DEEPGRAM_API_KEY') {
+    return null;
+  }
+  return apiKey;
 }
 
 function hasGeminiApiKey(): boolean {
@@ -1653,6 +1665,452 @@ async function transcribeAudioFileWithGroq(
   }
 }
 
+interface DeepgramWord {
+  word?: string;
+  punctuated_word?: string;
+  start?: number;
+  end?: number;
+  speaker?: number;
+}
+
+interface DeepgramUtterance {
+  start?: number;
+  end?: number;
+  transcript?: string;
+  speaker?: number;
+}
+
+interface DeepgramSentence {
+  text?: string;
+  start?: number;
+  end?: number;
+}
+
+interface DeepgramParagraph {
+  speaker?: number;
+  sentences?: DeepgramSentence[];
+}
+
+interface DeepgramListenResponse {
+  metadata?: {
+    duration?: number;
+  };
+  results?: {
+    channels?: Array<{
+      detected_language?: string;
+      alternatives?: Array<{
+        transcript?: string;
+        words?: DeepgramWord[];
+        paragraphs?: {
+          paragraphs?: DeepgramParagraph[];
+        };
+      }>;
+    }>;
+    utterances?: DeepgramUtterance[];
+  };
+}
+
+const ISO_LANGUAGE_NAMES: Record<string, string> = {
+  en: 'English',
+  hi: 'Hindi',
+  es: 'Spanish',
+  fr: 'French',
+  de: 'German',
+  it: 'Italian',
+  pt: 'Portuguese',
+  ru: 'Russian',
+  ja: 'Japanese',
+  ko: 'Korean',
+  zh: 'Chinese',
+  ar: 'Arabic',
+  nl: 'Dutch',
+  tr: 'Turkish',
+  pl: 'Polish',
+  sv: 'Swedish',
+  id: 'Indonesian',
+  vi: 'Vietnamese',
+  th: 'Thai',
+  ta: 'Tamil',
+  te: 'Telugu',
+  bn: 'Bengali',
+  mr: 'Marathi',
+  gu: 'Gujarati',
+  pa: 'Punjabi',
+  ur: 'Urdu',
+  multi: 'Multilingual',
+};
+
+function formatLanguageLabel(rawCode: string | undefined): string {
+  if (!rawCode) return 'Unknown';
+  const cleaned = rawCode.trim();
+  if (!cleaned || cleaned.toLowerCase() === 'unknown') return 'Unknown';
+  const base = cleaned.toLowerCase().split(/[-_]/)[0];
+  if (ISO_LANGUAGE_NAMES[base]) {
+    return ISO_LANGUAGE_NAMES[base];
+  }
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function isTransientDeepgramError(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  if (status === 429 || (typeof status === 'number' && status >= 500)) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return /429|rate.?limit|500|502|503|504|overloaded|ETIMEDOUT|ECONNRESET|TimeoutError|fetch failed/i.test(msg);
+}
+
+async function callDeepgramSingleFile(
+  apiKey: string,
+  filePath: string,
+  mimeType: string
+): Promise<DeepgramListenResponse> {
+  const params = new URLSearchParams({
+    model: DEEPGRAM_MODEL,
+    detect_language: 'true',
+    smart_format: 'true',
+    punctuate: 'true',
+    diarize: 'true',
+    utterances: 'true',
+    paragraphs: 'true',
+  });
+  const endpointUrl = `${DEEPGRAM_LISTEN_ENDPOINT}?${params.toString()}`;
+  const audioBuffer = await fs.readFile(filePath);
+  const contentType = mimeType && mimeType.includes('/') ? mimeType : 'audio/mp4';
+
+  const retryDelaysMs = [0, 3500, 9000];
+  let lastErr: unknown;
+
+  for (let i = 0; i < retryDelaysMs.length; i += 1) {
+    if (retryDelaysMs[i] > 0) {
+      const status = (lastErr as { status?: number })?.status;
+      const delayMs = status === 429 ? Math.max(retryDelaysMs[i], 9000) : retryDelaysMs[i];
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      const response = await fetch(endpointUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Token ${apiKey}`,
+          'Content-Type': contentType,
+        },
+        body: audioBuffer,
+        signal: AbortSignal.timeout(180000),
+      });
+
+      if (!response.ok) {
+        const errBody = await response.text().catch(() => '');
+        const err = new Error(
+          `Deepgram HTTP ${response.status}: ${errBody.slice(0, 180) || response.statusText}`
+        ) as Error & { status?: number };
+        err.status = response.status;
+        throw err;
+      }
+
+      return (await response.json()) as DeepgramListenResponse;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientDeepgramError(err)) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function coalesceSpeakerAwareSegments(
+  items: Array<{ startSeconds: number; endSeconds: number; speakerId: string; text: string }>
+): RawSegment[] {
+  const merged: RawSegment[] = [];
+  let current: { startSeconds: number; endSeconds: number; speakerId: string; text: string } | null = null;
+
+  for (const seg of items) {
+    if (!current) {
+      current = { ...seg };
+      continue;
+    }
+
+    const sameSpeaker = seg.speakerId === current.speakerId;
+    const gap = seg.startSeconds - current.endSeconds;
+    const combinedDuration = seg.endSeconds - current.startSeconds;
+    const combinedChars = current.text.length + 1 + seg.text.length;
+    const endsSentence = /[.?!।]["']?$/.test(current.text);
+    const currentDuration = current.endSeconds - current.startSeconds;
+
+    const shouldFlush =
+      !sameSpeaker ||
+      gap > 1.8 ||
+      combinedDuration > 12 ||
+      combinedChars > 240 ||
+      (endsSentence && currentDuration >= 4.2);
+
+    if (shouldFlush) {
+      merged.push({
+        startSeconds: current.startSeconds,
+        endSeconds: current.endSeconds,
+        speakerId: current.speakerId,
+        text: current.text,
+      });
+      current = { ...seg };
+    } else {
+      current.endSeconds = Math.max(current.endSeconds, seg.endSeconds);
+      current.text = `${current.text} ${seg.text}`.trim();
+    }
+  }
+
+  if (current) {
+    merged.push({
+      startSeconds: current.startSeconds,
+      endSeconds: current.endSeconds,
+      speakerId: current.speakerId,
+      text: current.text,
+    });
+  }
+
+  return merged;
+}
+
+function extractDeepgramSegments(
+  dg: DeepgramListenResponse,
+  fallbackDuration: number,
+  offsetSeconds: number
+): RawSegment[] {
+  const utterances = dg.results?.utterances;
+  if (Array.isArray(utterances) && utterances.length > 0) {
+    const mapped = utterances
+      .filter((u) => typeof u.transcript === 'string' && u.transcript.trim().length > 0)
+      .map((u) => {
+        const start = Math.max(0, Number(u.start) || 0) + offsetSeconds;
+        const end = Math.max(start + 0.5, (Number(u.end) || start + 2) + offsetSeconds);
+        const spkNum = typeof u.speaker === 'number' && Number.isFinite(u.speaker) ? u.speaker + 1 : 1;
+        return {
+          startSeconds: Number(start.toFixed(2)),
+          endSeconds: Number(end.toFixed(2)),
+          speakerId: `Speaker ${spkNum}`,
+          text: (u.transcript || '').trim().replace(/\s+/g, ' '),
+        };
+      });
+    if (mapped.length > 0) {
+      return coalesceSpeakerAwareSegments(mapped);
+    }
+  }
+
+  const alt = dg.results?.channels?.[0]?.alternatives?.[0];
+  const paragraphs = alt?.paragraphs?.paragraphs;
+  if (Array.isArray(paragraphs) && paragraphs.length > 0) {
+    const mapped: Array<{ startSeconds: number; endSeconds: number; speakerId: string; text: string }> = [];
+    for (const para of paragraphs) {
+      const spkNum = typeof para.speaker === 'number' && Number.isFinite(para.speaker) ? para.speaker + 1 : 1;
+      for (const sent of para.sentences ?? []) {
+        const text = (sent.text || '').trim().replace(/\s+/g, ' ');
+        if (!text) continue;
+        const start = Math.max(0, Number(sent.start) || 0) + offsetSeconds;
+        const end = Math.max(start + 0.5, (Number(sent.end) || start + 2) + offsetSeconds);
+        mapped.push({
+          startSeconds: Number(start.toFixed(2)),
+          endSeconds: Number(end.toFixed(2)),
+          speakerId: `Speaker ${spkNum}`,
+          text,
+        });
+      }
+    }
+    if (mapped.length > 0) {
+      return coalesceSpeakerAwareSegments(mapped);
+    }
+  }
+
+  const words = alt?.words;
+  if (Array.isArray(words) && words.length > 0) {
+    const mapped = words
+      .filter((w) => (w.punctuated_word || w.word || '').trim().length > 0)
+      .map((w) => {
+        const start = Math.max(0, Number(w.start) || 0) + offsetSeconds;
+        const end = Math.max(start + 0.1, (Number(w.end) || start + 0.3) + offsetSeconds);
+        const spkNum = typeof w.speaker === 'number' && Number.isFinite(w.speaker) ? w.speaker + 1 : 1;
+        return {
+          startSeconds: Number(start.toFixed(2)),
+          endSeconds: Number(end.toFixed(2)),
+          speakerId: `Speaker ${spkNum}`,
+          text: (w.punctuated_word || w.word || '').trim(),
+        };
+      });
+    if (mapped.length > 0) {
+      return coalesceSpeakerAwareSegments(mapped);
+    }
+  }
+
+  const fullText = (alt?.transcript || '').trim();
+  if (!fullText) return [];
+  return [
+    {
+      startSeconds: Number(offsetSeconds.toFixed(2)),
+      endSeconds: Number((offsetSeconds + Math.max(2, fallbackDuration)).toFixed(2)),
+      speakerId: 'Speaker 1',
+      text: fullText,
+    },
+  ];
+}
+
+async function transcribeAudioFileWithDeepgram(
+  apiKey: string,
+  filePath: string,
+  mimeType: string,
+  contextHint: string,
+  durationHintSeconds?: number,
+  onProgress?: ProgressUpdater
+): Promise<RawTranscriptPayload> {
+  let workingPath = filePath;
+  let workingMime = mimeType;
+  let workingExt = path.extname(filePath).toLowerCase() || '.m4a';
+  let cleanupAudioPath: string | null = null;
+  let effectiveDuration = durationHintSeconds;
+
+  const isDirectAudio =
+    mimeType === 'audio/mp4' ||
+    mimeType === 'audio/mpeg' ||
+    mimeType === 'audio/wav' ||
+    mimeType === 'audio/ogg' ||
+    mimeType === 'audio/flac';
+
+  if (!isDirectAudio) {
+    onProgress?.(1, 'Extracting audio track for Deepgram Nova-3...', 28);
+    const normalized = await normalizeFileToSpeechAudio(filePath);
+    workingPath = normalized.audioPath;
+    workingExt = normalized.ext;
+    workingMime = normalized.ext === '.mp3' ? 'audio/mpeg' : 'audio/mp4';
+    cleanupAudioPath = normalized.audioPath;
+    if (!effectiveDuration && normalized.durationSeconds) {
+      effectiveDuration = normalized.durationSeconds;
+    }
+  } else if (!effectiveDuration) {
+    effectiveDuration = await probeAudioDuration(workingPath);
+  }
+
+  try {
+    const workingStat = await fs.stat(workingPath);
+    const shouldChunk = workingStat.size > DEEPGRAM_MAX_SINGLE_FILE_BYTES;
+
+    let allSegments: RawSegment[] = [];
+    let detectedLanguage = 'Unknown';
+    let measuredDuration = effectiveDuration || 0;
+
+    if (shouldChunk) {
+      const chunkDir = path.join(os.tmpdir(), `cuescript_dg_chunks_${crypto.randomBytes(6).toString('hex')}`);
+      await fs.mkdir(chunkDir, { recursive: true });
+      try {
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-nostats',
+            '-loglevel',
+            'error',
+            '-y',
+            '-i',
+            workingPath,
+            '-vn',
+            '-f',
+            'segment',
+            '-segment_time',
+            String(DEEPGRAM_CHUNK_DURATION_SECONDS),
+            '-reset_timestamps',
+            '1',
+            '-c',
+            'copy',
+            path.join(chunkDir, `chunk_%03d${workingExt}`),
+          ],
+          { timeout: 45000 }
+        );
+
+        const chunkFiles = (await fs.readdir(chunkDir))
+          .filter((f) => f.endsWith(workingExt))
+          .sort();
+
+        const chunkResults: Array<{
+          response: DeepgramListenResponse;
+          chunkDuration: number;
+        }> = new Array(chunkFiles.length);
+
+        const concurrency = 2;
+        let nextIndex = 0;
+        let completed = 0;
+
+        onProgress?.(
+          2,
+          `Transcribing ${chunkFiles.length} audio segments with Deepgram Nova-3 (0 / ${chunkFiles.length})...`,
+          38
+        );
+
+        async function worker() {
+          while (nextIndex < chunkFiles.length) {
+            const idx = nextIndex++;
+            const chunkPath = path.join(chunkDir, chunkFiles[idx]);
+            const res = await callDeepgramSingleFile(apiKey, chunkPath, workingMime);
+            const chunkDur = Number(res.metadata?.duration) || DEEPGRAM_CHUNK_DURATION_SECONDS;
+            chunkResults[idx] = { response: res, chunkDuration: chunkDur };
+            completed += 1;
+            const pct = 38 + Math.round((completed / chunkFiles.length) * 50);
+            onProgress?.(
+              2,
+              `Transcribing with Deepgram Nova-3 (${completed} / ${chunkFiles.length} segments done)...`,
+              pct
+            );
+          }
+        }
+
+        await Promise.all(
+          Array.from({ length: Math.min(concurrency, chunkFiles.length) }, () => worker())
+        );
+
+        let runningOffset = 0;
+        for (const item of chunkResults) {
+          if (!item) continue;
+          const lang = item.response.results?.channels?.[0]?.detected_language;
+          if (detectedLanguage === 'Unknown' && lang) {
+            detectedLanguage = lang;
+          }
+          const segs = extractDeepgramSegments(item.response, item.chunkDuration, runningOffset);
+          allSegments.push(...segs);
+          runningOffset += item.chunkDuration;
+        }
+        measuredDuration = Math.max(measuredDuration, runningOffset);
+      } finally {
+        await fs.rm(chunkDir, { recursive: true, force: true }).catch(() => {});
+      }
+    } else {
+      onProgress?.(2, `Transcribing speech & diarizing speakers with Deepgram (${DEEPGRAM_MODEL})...`, 54);
+      const res = await callDeepgramSingleFile(apiKey, workingPath, workingMime);
+      const lang = res.results?.channels?.[0]?.detected_language;
+      if (lang) detectedLanguage = lang;
+      const dur = Number(res.metadata?.duration) || measuredDuration || 0;
+      measuredDuration = Math.max(measuredDuration, dur);
+      allSegments = extractDeepgramSegments(res, dur, 0);
+    }
+
+    onProgress?.(3, 'Building chapter timeline & exports...', 92);
+    const formattedLang = formatLanguageLabel(detectedLanguage);
+    const heuristic = buildHeuristicChaptersAndSummary(allSegments, measuredDuration);
+    const enriched = await enrichChaptersWithGeminiText(
+      allSegments,
+      measuredDuration,
+      formattedLang,
+      contextHint
+    );
+
+    return {
+      title: enriched?.title || heuristic.title,
+      language: formattedLang,
+      durationSeconds: Math.round(measuredDuration),
+      summary: enriched?.summary || heuristic.summary,
+      chapters: enriched?.chapters || heuristic.chapters,
+      segments: allSegments,
+    };
+  } finally {
+    if (cleanupAudioPath) {
+      await fs.unlink(cleanupAudioPath).catch(() => {});
+    }
+  }
+}
+
 async function transcribeFileWithGroqPrimaryOrGeminiFallback(params: {
   filePath: string;
   mimeType: string;
@@ -1661,8 +2119,11 @@ async function transcribeFileWithGroqPrimaryOrGeminiFallback(params: {
   onProgress?: ProgressUpdater;
 }): Promise<{ payload: RawTranscriptPayload; engineLabel: string }> {
   const groq = getGroqClient();
+  const deepgramKey = getDeepgramApiKey();
   let groqFailed = false;
+  let deepgramFailed = false;
 
+  // Tier 1: Groq Whisper (whisper-large-v3)
   if (groq) {
     try {
       const payload = await transcribeAudioFileWithGroq(
@@ -1677,11 +2138,43 @@ async function transcribeFileWithGroqPrimaryOrGeminiFallback(params: {
     } catch (err) {
       groqFailed = true;
       const safeReason = err instanceof Error ? err.message.slice(0, 140) : 'unknown error';
-      console.warn(`Groq Whisper transcription failed; falling back to Google Gemini (${safeReason})`);
-      params.onProgress?.(2, 'Groq unavailable — falling back to Google Gemini...', 36);
+      console.warn(`Groq Whisper transcription failed (${safeReason}); trying next fallback.`);
+      params.onProgress?.(
+        2,
+        deepgramKey
+          ? 'Groq unavailable — switching to Deepgram Nova-3 fallback...'
+          : 'Groq unavailable — switching to Google Gemini fallback...',
+        36
+      );
     }
   }
 
+  // Tier 2: Deepgram (nova-3)
+  if (deepgramKey) {
+    try {
+      const payload = await transcribeAudioFileWithDeepgram(
+        deepgramKey,
+        params.filePath,
+        params.mimeType,
+        params.contextHint,
+        params.durationHintSeconds,
+        params.onProgress
+      );
+      return {
+        payload,
+        engineLabel: groqFailed
+          ? `Deepgram (${DEEPGRAM_MODEL}) fallback (after Groq error)`
+          : `Deepgram (${DEEPGRAM_MODEL})`,
+      };
+    } catch (err) {
+      deepgramFailed = true;
+      const safeReason = err instanceof Error ? err.message.slice(0, 140) : 'unknown error';
+      console.warn(`Deepgram Nova-3 transcription failed (${safeReason}); falling back to Google Gemini.`);
+      params.onProgress?.(2, 'Deepgram unavailable — falling back to Google Gemini...', 40);
+    }
+  }
+
+  // Tier 3: Google Gemini (last fallback)
   const ai = getGeminiClient();
   const payload = await transcribeWithGeminiFilePath(
     ai,
@@ -1691,11 +2184,17 @@ async function transcribeFileWithGroqPrimaryOrGeminiFallback(params: {
     params.durationHintSeconds,
     params.onProgress
   );
+  const fallbackNote =
+    groqFailed && deepgramFailed
+      ? 'after Groq & Deepgram errors'
+      : groqFailed
+        ? 'after Groq error'
+        : deepgramFailed
+          ? 'after Deepgram error'
+          : 'GROQ_API_KEY & DEEPGRAM_API_KEY not configured';
   return {
     payload,
-    engineLabel: groqFailed
-      ? 'Google Gemini fallback (after Groq error)'
-      : 'Google Gemini fallback (GROQ_API_KEY not configured)',
+    engineLabel: `Google Gemini final fallback (${fallbackNote})`,
   };
 }
 
@@ -1740,28 +2239,28 @@ function formatGeminiError(err: unknown): { status: number; message: string } {
     return {
       status: 500,
       message:
-        'Neither GROQ_API_KEY nor GEMINI_API_KEY is configured on the server. Add GROQ_API_KEY in Settings > Secrets to use Groq Whisper (with Gemini as fallback).',
+        'No active transcription key succeeded (Groq -> Deepgram -> Gemini). Configure GROQ_API_KEY, DEEPGRAM_API_KEY, or GEMINI_API_KEY in Settings > Secrets.',
     };
   }
   if (/PERMISSION_DENIED|API_KEY_INVALID|403|401/i.test(msg)) {
     return {
       status: 403,
       message:
-        'The transcription API rejected the configured key. Please verify GROQ_API_KEY / GEMINI_API_KEY in Settings > Secrets.',
+        'The transcription API rejected the configured key. Please verify GROQ_API_KEY, DEEPGRAM_API_KEY, and GEMINI_API_KEY in Settings > Secrets.',
     };
   }
   if (/RESOURCE_EXHAUSTED|429/i.test(msg)) {
     return {
       status: 429,
       message:
-        'Transcription API rate limit reached on both primary and fallback engines. Wait a moment before retrying.',
+        'Transcription API rate limit reached across configured engines (Groq -> Deepgram -> Gemini). Wait a moment before retrying.',
     };
   }
   if (/503|UNAVAILABLE|high demand/i.test(msg)) {
     return {
       status: 503,
       message:
-        'The fallback transcription model is temporarily experiencing high demand. Please retry in a few seconds.',
+        'The final fallback transcription model is temporarily experiencing high demand. Please retry in a few seconds.',
     };
   }
   return {
@@ -1783,10 +2282,22 @@ async function startServer() {
 
   app.get('/api/health', (_req: Request, res: Response) => {
     const groqConfigured = Boolean(getGroqClient());
+    const deepgramConfigured = Boolean(getDeepgramApiKey());
+    const geminiConfigured = hasGeminiApiKey();
     res.json({
       ok: true,
-      primaryEngine: groqConfigured ? `groq:${GROQ_WHISPER_MODEL}` : `gemini:${GEMINI_MODEL}`,
+      primaryEngine: groqConfigured
+        ? `groq:${GROQ_WHISPER_MODEL}`
+        : deepgramConfigured
+          ? `deepgram:${DEEPGRAM_MODEL}`
+          : `gemini:${GEMINI_MODEL}`,
+      fallbackChain: [
+        { engine: `groq:${GROQ_WHISPER_MODEL}`, configured: groqConfigured },
+        { engine: `deepgram:${DEEPGRAM_MODEL}`, configured: deepgramConfigured },
+        { engine: `gemini:${GEMINI_MODEL}`, configured: geminiConfigured },
+      ],
       groqConfigured,
+      deepgramConfigured,
       fallbackModel: GEMINI_MODEL,
     });
   });
@@ -1925,59 +2436,96 @@ async function startServer() {
     // Execute transcription asynchronously so long videos never hit proxy HTTP timeouts
     void (async () => {
       try {
-        // 1. YouTube: Groq Whisper primary (via yt-dlp audio extraction), Google Gemini fileUri as automatic fallback
+        // 1. YouTube: Tier 1 Groq Whisper -> Tier 2 Deepgram Nova-3 (via yt-dlp audio) -> Tier 3 Google Gemini fileUri fallback
         if (platform === 'youtube' && youtubeId) {
           const canonicalUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
           updateProgress(1, 'Fetching YouTube video metadata...', 16);
           const oembed = await fetchYouTubeMetadata(canonicalUrl);
           const groq = getGroqClient();
+          const deepgramKey = getDeepgramApiKey();
 
-          if (groq) {
+          if (groq || deepgramKey) {
             try {
-              updateProgress(1, 'Extracting YouTube audio for Groq Whisper...', 24);
+              updateProgress(1, 'Extracting YouTube audio stream (yt-dlp)...', 24);
               const extractedYt = await extractSocialAudioWithYtDlp(canonicalUrl);
-              const parsed = await transcribeAudioFileWithGroq(
-                groq,
-                extractedYt.audioPath,
-                extractedYt.mimeType,
-                `YouTube Video Title: ${oembed.title || extractedYt.title || 'Unknown'}`,
-                extractedYt.durationSeconds,
-                updateProgress
-              );
+              const ytContext = `YouTube Video Title: ${oembed.title || extractedYt.title || 'Unknown'}`;
+              let parsed: RawTranscriptPayload | null = null;
+              let engineLabel = '';
+              let ytGroqFailed = false;
 
-              record.job = normalizeTranscriptResult(
-                {
-                  ...parsed,
-                  durationSeconds: extractedYt.durationSeconds || parsed.durationSeconds,
-                },
-                {
-                  sourceType: 'youtube',
-                  sourceUrl: canonicalUrl,
-                  embedVideoId: youtubeId,
-                  mediaKind: 'youtube',
-                  thumbnailUrl:
-                    oembed.thumbnailUrl ||
-                    extractedYt.thumbnailUrl ||
-                    `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`,
-                  fallbackTitle:
-                    oembed.title || extractedYt.title || parsed.title || 'YouTube Video Transcript',
-                  author: oembed.author || extractedYt.author,
-                  extractionMethod: `Groq Whisper (${GROQ_WHISPER_MODEL}) via yt-dlp + FFmpeg`,
+              if (groq) {
+                try {
+                  parsed = await transcribeAudioFileWithGroq(
+                    groq,
+                    extractedYt.audioPath,
+                    extractedYt.mimeType,
+                    ytContext,
+                    extractedYt.durationSeconds,
+                    updateProgress
+                  );
+                  engineLabel = `Groq Whisper (${GROQ_WHISPER_MODEL})`;
+                } catch (ytGroqErr) {
+                  ytGroqFailed = true;
+                  const safeReason =
+                    ytGroqErr instanceof Error ? ytGroqErr.message.slice(0, 120) : 'groq failed';
+                  console.warn(`YouTube Groq transcription failed: ${safeReason}`);
+                  if (deepgramKey) {
+                    updateProgress(2, 'Groq unavailable — switching to Deepgram Nova-3 fallback...', 38);
+                  }
                 }
-              );
-              record.status = 'completed';
-              record.progressPct = 100;
-              return;
-            } catch (ytGroqErr) {
+              }
+
+              if (!parsed && deepgramKey) {
+                parsed = await transcribeAudioFileWithDeepgram(
+                  deepgramKey,
+                  extractedYt.audioPath,
+                  extractedYt.mimeType,
+                  ytContext,
+                  extractedYt.durationSeconds,
+                  updateProgress
+                );
+                engineLabel = ytGroqFailed
+                  ? `Deepgram (${DEEPGRAM_MODEL}) fallback (after Groq error)`
+                  : `Deepgram (${DEEPGRAM_MODEL})`;
+              }
+
+              if (parsed) {
+                record.job = normalizeTranscriptResult(
+                  {
+                    ...parsed,
+                    durationSeconds: extractedYt.durationSeconds || parsed.durationSeconds,
+                  },
+                  {
+                    sourceType: 'youtube',
+                    sourceUrl: canonicalUrl,
+                    embedVideoId: youtubeId,
+                    mediaKind: 'youtube',
+                    thumbnailUrl:
+                      oembed.thumbnailUrl ||
+                      extractedYt.thumbnailUrl ||
+                      `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`,
+                    fallbackTitle:
+                      oembed.title || extractedYt.title || parsed.title || 'YouTube Video Transcript',
+                    author: oembed.author || extractedYt.author,
+                    extractionMethod: `${engineLabel} via yt-dlp native audio`,
+                  }
+                );
+                record.status = 'completed';
+                record.progressPct = 100;
+                return;
+              }
+            } catch (ytExtractOrEngineErr) {
               const safeReason =
-                ytGroqErr instanceof Error ? ytGroqErr.message.slice(0, 120) : 'extraction failed';
-              console.warn(`YouTube Groq path fell back to Gemini: ${safeReason}`);
-              updateProgress(2, 'Switching to Google Gemini YouTube fallback...', 42);
+                ytExtractOrEngineErr instanceof Error
+                  ? ytExtractOrEngineErr.message.slice(0, 120)
+                  : 'extraction failed';
+              console.warn(`YouTube Groq/Deepgram path fell back to Gemini: ${safeReason}`);
+              updateProgress(2, 'Switching to Google Gemini YouTube final fallback...', 42);
             }
           }
 
           const ai = getGeminiClient();
-          updateProgress(2, 'Transcribing YouTube video via Google Gemini fallback...', 52);
+          updateProgress(2, 'Transcribing YouTube video via Google Gemini final fallback...', 52);
           const parsed = await generateStructuredTranscriptWithRetry(ai, [
             {
               fileData: {
@@ -1999,9 +2547,10 @@ async function startServer() {
             thumbnailUrl: oembed.thumbnailUrl || `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`,
             fallbackTitle: oembed.title || parsed.title || 'YouTube Video Transcript',
             author: oembed.author,
-            extractionMethod: groq
-              ? 'Google Gemini fallback (Direct YouTube fileUri)'
-              : 'Google Gemini fallback (GROQ_API_KEY not configured)',
+            extractionMethod:
+              groq || deepgramKey
+                ? 'Google Gemini final fallback (Direct YouTube fileUri)'
+                : 'Google Gemini final fallback (GROQ_API_KEY & DEEPGRAM_API_KEY not configured)',
           });
           record.status = 'completed';
           record.progressPct = 100;
