@@ -12,7 +12,6 @@ interface IngestPanelProps {
   errorState: TranscribeApiError | null;
   onSubmitUrl: (url: string) => void;
   onUploadFile: (file: File, context?: { sourceUrl?: string; sourcePlatform?: MediaPlatform }) => void;
-  onInspectPlatforms: () => void;
   compact?: boolean;
 }
 
@@ -33,7 +32,6 @@ export function IngestPanel({
   errorState,
   onSubmitUrl,
   onUploadFile,
-  onInspectPlatforms,
   compact = false,
 }: IngestPanelProps) {
   const [mode, setMode] = useState<'url' | 'upload'>('url');
@@ -324,13 +322,6 @@ export function IngestPanel({
                   >
                     <Upload className="h-3.5 w-3.5" aria-hidden="true" />
                     Upload Downloaded Clip Now
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onInspectPlatforms}
-                    className="whitespace-nowrap text-xs font-medium text-[#78350F] underline underline-offset-4 hover:text-[#451A03] cursor-pointer"
-                  >
-                    Why Meta blocks servers &amp; how to fix in production
                   </button>
                 </div>
               )}

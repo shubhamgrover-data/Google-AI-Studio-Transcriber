@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import express from 'express';
 import type { Request, Response } from 'express';
 import multer from 'multer';
+import ffmpegStatic from 'ffmpeg-static';
 import Groq from 'groq-sdk';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
@@ -24,6 +25,11 @@ const MAX_MEDIA_BYTES = 25 * 1024 * 1024; // 25 MB upload limit
 const MAX_EXTRACTED_AUDIO_BYTES = 80 * 1024 * 1024; // 80 MB (~5 hours of 32kbps mono speech MP3)
 const INLINE_MEDIA_LIMIT_BYTES = 10 * 1024 * 1024; // 10 MB inline; larger uses Gemini Files API
 const GROQ_WHISPER_MODEL = 'whisper-large-v3';
+const OPENAI_COMPAT_ANALYSIS_BASE_URL = (
+  process.env.ANALYSIS_OPENAI_BASE_URL || 'https://apps.mrcoder.buzz/gpt/v1'
+).replace(/\/+$/, '');
+const OPENAI_COMPAT_ANALYSIS_MODEL =
+  process.env.ANALYSIS_OPENAI_MODEL || 'gpt-5.4-2026-03-05';
 const GROQ_MAX_SINGLE_FILE_BYTES = 18 * 1024 * 1024; // Keep well under Groq 25 MB file limit
 const GROQ_CHUNK_DURATION_SECONDS = 900; // 15-minute chunks (~3.6 MB each at 32 kbps mono MP3)
 const DEEPGRAM_MODEL = 'nova-3';
@@ -31,8 +37,13 @@ const DEEPGRAM_LISTEN_ENDPOINT = 'https://api.deepgram.com/v1/listen';
 const DEEPGRAM_MAX_SINGLE_FILE_BYTES = 30 * 1024 * 1024; // Stream directly up to 30 MB; chunk larger files
 const DEEPGRAM_CHUNK_DURATION_SECONDS = 1200; // 20-minute chunks for very large files
 const GEMINI_MODEL = 'gemini-4-hydrogen';
-const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'cuescript-yt-dlp');
-const YTDLP_DOWNLOAD_URL = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+const FFMPEG_BIN =
+  typeof ffmpegStatic === 'string' && existsSync(ffmpegStatic) ? ffmpegStatic : 'ffmpeg';
+const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'cuescript-yt-dlp-linux-elf');
+const YTDLP_DOWNLOAD_URL =
+  process.arch === 'arm64'
+    ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64'
+    : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 
 interface EphemeralMediaEntry {
   filePath: string;
@@ -67,27 +78,34 @@ function registerEphemeralMedia(filePath: string, mimeType: string): string {
 
 async function ensureYtDlpBinary(): Promise<string> {
   if (existsSync(YTDLP_BIN_PATH)) {
-    return YTDLP_BIN_PATH;
+    try {
+      const stat = statSync(YTDLP_BIN_PATH);
+      if (stat.size > 10 * 1024 * 1024) {
+        return YTDLP_BIN_PATH;
+      }
+    } catch {
+      // Fall through to re-download
+    }
   }
   if (!ytdlpReadyPromise) {
     ytdlpReadyPromise = (async () => {
-      // Reuse /tmp/yt-dlp if present, otherwise download latest official standalone yt-dlp
-      const legacyPath = '/tmp/yt-dlp';
-      if (existsSync(legacyPath)) {
-        await fs.copyFile(legacyPath, YTDLP_BIN_PATH);
-        await fs.chmod(YTDLP_BIN_PATH, 0o755);
-        return YTDLP_BIN_PATH;
-      }
+      // Download official self-contained Linux ELF yt-dlp binary (zero python3 dependency)
       const res = await fetch(YTDLP_DOWNLOAD_URL, {
         redirect: 'follow',
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(60000),
       });
       if (!res.ok) {
-        throw new Error(`Failed to fetch yt-dlp binary (HTTP ${res.status})`);
+        throw new Error(`Failed to fetch standalone yt-dlp_linux binary (HTTP ${res.status})`);
       }
       const bytes = Buffer.from(await res.arrayBuffer());
-      await fs.writeFile(YTDLP_BIN_PATH, bytes);
-      await fs.chmod(YTDLP_BIN_PATH, 0o755);
+      // Verify ELF header (\x7fELF) so we never cache a truncated or HTML error page
+      if (bytes.length < 10 * 1024 * 1024 || bytes[0] !== 0x7f || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46) {
+        throw new Error('Downloaded yt-dlp binary failed integrity check.');
+      }
+      const tmpPath = `${YTDLP_BIN_PATH}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+      await fs.writeFile(tmpPath, bytes);
+      await fs.chmod(tmpPath, 0o755);
+      await fs.rename(tmpPath, YTDLP_BIN_PATH);
       return YTDLP_BIN_PATH;
     })().catch((err) => {
       ytdlpReadyPromise = null;
@@ -122,26 +140,24 @@ async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
   let rawMediaFile: string | undefined;
 
   try {
-    await execFileAsync(
-      ytdlpBin,
-      [
-        '--no-playlist',
-        '--no-warnings',
-        '--write-info-json',
-        '--max-filesize',
-        '150M',
-        '-f',
-        'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
-        '-o',
-        outputTemplate,
-        '--',
-        targetUrl,
-      ],
-      {
-        timeout: 90000,
-        maxBuffer: 4 * 1024 * 1024,
-      }
-    );
+    const ytdlpArgs = [
+      '--no-playlist',
+      '--no-warnings',
+      '--write-info-json',
+      '--max-filesize',
+      '150M',
+      '-f',
+      'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
+      ...(FFMPEG_BIN !== 'ffmpeg' ? ['--ffmpeg-location', FFMPEG_BIN] : []),
+      '-o',
+      outputTemplate,
+      '--',
+      targetUrl,
+    ];
+    await execFileAsync(ytdlpBin, ytdlpArgs, {
+      timeout: 90000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
 
     const files = await fs.readdir(workDir);
     const infoFile = files.find((f) => f.endsWith('.info.json'));
@@ -202,7 +218,7 @@ async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
       let streamCopied = false;
       try {
         await execFileAsync(
-          'ffmpeg',
+          FFMPEG_BIN,
           ['-nostats', '-loglevel', 'error', '-y', '-i', rawMediaFile, '-vn', '-c:a', 'copy', copyM4aPath],
           { timeout: 45000, maxBuffer: 4 * 1024 * 1024 }
         );
@@ -226,7 +242,7 @@ async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
         );
         try {
           await execFileAsync(
-            'ffmpeg',
+            FFMPEG_BIN,
             [
               '-nostats',
               '-loglevel',
@@ -957,7 +973,7 @@ async function transcribeWithGeminiFilePath(
     await fs.mkdir(chunkDir, { recursive: true });
     try {
       await execFileAsync(
-        'ffmpeg',
+        FFMPEG_BIN,
         [
           '-nostats',
           '-loglevel',
@@ -1144,6 +1160,31 @@ function isTransientGroqError(err: unknown): boolean {
 }
 
 async function probeAudioDuration(filePath: string): Promise<number | undefined> {
+  // Primary: parse Duration from bundled static ffmpeg metadata probe (~15ms, zero ffprobe dependency)
+  try {
+    const { stderr } = await execFileAsync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], {
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+    });
+    const match = stderr.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/);
+    if (match) {
+      const total = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+      if (Number.isFinite(total) && total > 0) {
+        return Math.round(total);
+      }
+    }
+  } catch (err) {
+    const stderr = (err as { stderr?: string })?.stderr || '';
+    const match = stderr.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/);
+    if (match) {
+      const total = Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+      if (Number.isFinite(total) && total > 0) {
+        return Math.round(total);
+      }
+    }
+  }
+
+  // Optional fallback: system ffprobe if available
   try {
     const { stdout } = await execFileAsync(
       'ffprobe',
@@ -1177,7 +1218,7 @@ async function normalizeFileToSpeechAudio(inputPath: string): Promise<{
   const m4aPath = path.join(os.tmpdir(), `cuescript_groq_${crypto.randomBytes(6).toString('hex')}.m4a`);
   try {
     await execFileAsync(
-      'ffmpeg',
+      FFMPEG_BIN,
       ['-nostats', '-loglevel', 'error', '-y', '-i', inputPath, '-vn', '-c:a', 'copy', m4aPath],
       { timeout: 45000, maxBuffer: 4 * 1024 * 1024 }
     );
@@ -1194,7 +1235,7 @@ async function normalizeFileToSpeechAudio(inputPath: string): Promise<{
   // Fallback: fast 16 kHz mono 32 kbps MP3 transcode
   const mp3Path = path.join(os.tmpdir(), `cuescript_groq_${crypto.randomBytes(6).toString('hex')}.mp3`);
   await execFileAsync(
-    'ffmpeg',
+    FFMPEG_BIN,
     [
       '-nostats',
       '-loglevel',
@@ -1539,7 +1580,7 @@ async function transcribeAudioFileWithGroq(
       await fs.mkdir(chunkDir, { recursive: true });
       try {
         await execFileAsync(
-          'ffmpeg',
+          FFMPEG_BIN,
           [
             '-nostats',
             '-loglevel',
@@ -1999,7 +2040,7 @@ async function transcribeAudioFileWithDeepgram(
       await fs.mkdir(chunkDir, { recursive: true });
       try {
         await execFileAsync(
-          'ffmpeg',
+          FFMPEG_BIN,
           [
             '-nostats',
             '-loglevel',
@@ -2827,6 +2868,551 @@ async function startServer() {
     });
   });
 
+  const ATF_ANALYSIS_PROMPT = `You are a financial transcript analyst. I am providing two inputs:
+1. A timestamped video/livestream transcript (which may be in Hindi, Hinglish, or English with speech-to-text typos).
+2. A reference image listing the "ATF Top 60 Stocks" with their serial numbers (#1–#60).
+
+Your task is to cross-reference EVERY stock mentioned in the transcript against EVERY stock in the ATF Top 60 image and produce a strictly structured output.
+
+### Step-by-Step Rules (Follow Strictly)
+
+1. Read the Reference Image Completely:
+- First extract all 60 numbered stocks from the ATF Top 60 image exactly as listed (preserve the image's serial numbers, including any duplicate or skipped numbering quirks).
+
+2. Decode Speech-to-Text (ASR) Errors Carefully:
+- Transcripts may contain phonetic Hindi/English typos for Indian stock names (e.g., "मन्नापूरम फनांस" = Manappuram Finance, "टीएमपीवी" = Tata Motors Passenger Vehicles, "एसडीएफसी" = HDFC Bank, "वोटर फोन / वीआई" = Vodafone Idea, "NSC" = NSE, "आये अरेफ से" = IRFC).
+- Normalize clear phonetic matches to the official company name.
+- If a stock name is garbled and cannot be identified with certainty, keep it verbatim and append *(as transcribed)*. Never guess or invent a company name.
+
+3. Apply Strict "Strong Buy" Classification Criteria:
+- Include a stock in Tables 1 or 2 ONLY if the speaker gives an emphatic bullish call, such as:
+- "बहुत अच्छा है" / "बहुत बहुत अच्छा है" (very good)
+- "भर-भर के खरीदो" / "खूब खरीदो" / "लगातार खरीदो" (buy heavily / continuously)
+- "हर फ्राइडे खरीदो" (buy every Friday / 26 months)
+- Explicit "a steal", "#1 stock", or strong multi-bagger / 2x–3x / specific upside target call (including high-conviction swing trades).
+- Do NOT include in Tables 1 or 2:
+- Stocks only called plain "अच्छा है" / "ठीक है" (mild buy/good) without strong conviction or buying frequency.
+- Stocks marked "too expensive / wait", "hold only", "book profit / exit", "avoid", or "sell".
+- Stocks mentioned only in passing as sector/FII allocation examples with no direct buy recommendation.
+- Commodities or ETFs (e.g., Gold, Silver, Gold BeES) — exclude them from the stock tables.
+
+4. Capture Exact Levels, Targets, Timestamps & Conflicts:
+- List every timestamp where the stock is discussed (e.g., 04:06, 43:57).
+- Extract exact entry prices, dip levels, exit/target prices, holding horizons, and buying cadence (e.g., "all 4 Fridays/month", "1 Friday/month", "3-month swing trade").
+- If no price level is mentioned, explicitly write No price level given.
+- If the speaker gives different targets at different timestamps, report both with their timestamps—do not pick one.
+- Do not add external market prices, live quotes, or your own financial advice.
+
+5. Mandatory Count Verification (Do Silently Before Outputting):
+- Verify that: (ATF 60 stocks discussed in transcript—whether Strong Buy or not) + (ATF 60 stocks NOT discussed in transcript) = Total stocks in the ATF Top 60 image.
+- Do not miss any stock from the image.
+
+### Required Output Format (Follow Exactly)
+
+Output ONLY the following 3 sections in exact Markdown table format:
+
+### 1. Strong Buy Stocks — IN ATF Top 60
+
+| ATF # | Stock | Timestamp | Levels, Targets & Buying Guidance |
+| :--- | :--- | :--- | :--- |
+| [Number from image] | [Company Name] | [MM:SS] | [Exact entry/target levels, horizon, buying frequency, and key speaker notes] |
+
+*Note on other ATF 60 stocks discussed in the transcript (not called "strong buy"):* [One concise paragraph listing every other ATF 60 stock mentioned in the transcript with its ATF # and the speaker's actual stance—especially flagging any stock on the ATF 60 list that the speaker called "wait", "avoid", or "sell", or only mentioned in passing.]
+
+### 2. Strong Buy Stocks — OUTSIDE ATF Top 60
+
+| Stock | Timestamp | Levels, Targets & Buying Guidance |
+| :--- | :--- | :--- |
+| [Company Name] | [MM:SS] | [Exact entry/target levels, horizon, buying frequency, and key speaker notes] |
+
+### 3. Stocks in ATF Top 60 — NOT Discussed in the Transcript ([Count] Stocks)
+
+| ATF # | Company | ATF # | Company |
+| :--- | :--- | :--- | :--- |
+| [Number] | [Company Name] | [Number] | [Company Name] |`;
+
+  const ALLOWED_ATF_REF_FILES: Array<{ fileName: string; mimeType: string }> = [
+    { fileName: 'ATF60Stocks.jpg', mimeType: 'image/jpeg' },
+    { fileName: 'ATF60Stocks.jpeg', mimeType: 'image/jpeg' },
+    { fileName: 'ATF60Stocks.png', mimeType: 'image/png' },
+  ];
+
+  function resolveAtfReferenceImage(): {
+    filePath: string;
+    fileName: string;
+    mimeType: string;
+    publicUrl: string;
+  } | null {
+    const searchDirs = Array.from(
+      new Set([
+        path.resolve(__dirname, 'public'),
+        path.resolve(__dirname, 'dist'),
+        path.resolve(process.cwd(), 'public'),
+        path.resolve(process.cwd(), 'dist'),
+      ])
+    );
+    for (const dir of searchDirs) {
+      for (const candidate of ALLOWED_ATF_REF_FILES) {
+        const fullPath = path.resolve(dir, candidate.fileName);
+        if (fullPath.startsWith(dir + path.sep) && existsSync(fullPath)) {
+          return {
+            filePath: fullPath,
+            fileName: candidate.fileName,
+            mimeType: candidate.mimeType,
+            publicUrl: '/api/analysis/reference/image',
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  function detectImageMimeFromMagicBytes(buf: Buffer): 'image/jpeg' | 'image/png' | 'image/webp' | null {
+    if (buf.length < 12) return null;
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47 &&
+      buf[4] === 0x0d &&
+      buf[5] === 0x0a &&
+      buf[6] === 0x1a &&
+      buf[7] === 0x0a
+    ) {
+      return 'image/png';
+    }
+    if (
+      buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      buf.subarray(8, 12).toString('ascii') === 'WEBP'
+    ) {
+      return 'image/webp';
+    }
+    return null;
+  }
+
+  function isProgressiveJpeg(buf: Buffer): boolean {
+    if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return false;
+    let offset = 2;
+    while (offset + 3 < buf.length) {
+      if (buf[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      while (offset < buf.length && buf[offset] === 0xff) offset += 1;
+      if (offset >= buf.length) break;
+      const marker = buf[offset];
+      offset += 1;
+      if (marker === 0xc2) return true; // SOF2 progressive DCT
+      if (marker === 0xc0) return false; // SOF0 baseline DCT
+      if (marker === 0xd9 || marker === 0xda) break; // EOI or SOS
+      if (marker >= 0xd0 && marker <= 0xd8) continue;
+      if (offset + 1 >= buf.length) break;
+      const segLen = (buf[offset] << 8) | buf[offset + 1];
+      if (segLen < 2) break;
+      offset += segLen;
+    }
+    return false;
+  }
+
+  async function normalizeReferenceImageForVision(
+    buf: Buffer
+  ): Promise<{ buffer: Buffer; mimeType: 'image/jpeg' | 'image/png' }> {
+    const MAX_GROQ_IMAGE_BYTES = 2_800_000; // Keep base64 payload comfortably under Groq's 4 MB limit
+    const detected = detectImageMimeFromMagicBytes(buf);
+
+    if (
+      detected === 'image/jpeg' &&
+      buf.byteLength <= MAX_GROQ_IMAGE_BYTES &&
+      !isProgressiveJpeg(buf)
+    ) {
+      return { buffer: buf, mimeType: 'image/jpeg' };
+    }
+    if (detected === 'image/png' && buf.byteLength <= MAX_GROQ_IMAGE_BYTES) {
+      return { buffer: buf, mimeType: 'image/png' };
+    }
+
+    const workDir = path.join(os.tmpdir(), `cuescript_img_${crypto.randomBytes(6).toString('hex')}`);
+    await fs.mkdir(workDir, { recursive: true });
+    const inExt = detected === 'image/png' ? '.png' : detected === 'image/webp' ? '.webp' : '.jpg';
+    const inPath = path.join(workDir, `input${inExt}`);
+    const outPath = path.join(workDir, 'normalized.jpg');
+
+    try {
+      await fs.writeFile(inPath, buf);
+      await execFileAsync(
+        FFMPEG_BIN,
+        [
+          '-y',
+          '-i',
+          inPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          "scale='min(1600,iw)':-2",
+          '-pix_fmt',
+          'yuvj420p',
+          '-q:v',
+          '3',
+          outPath,
+        ],
+        { timeout: 15_000 }
+      );
+      const outBuf = await fs.readFile(outPath);
+      if (detectImageMimeFromMagicBytes(outBuf) !== 'image/jpeg') {
+        throw new Error('Reference image could not be encoded as a valid baseline JPEG.');
+      }
+      return { buffer: outBuf, mimeType: 'image/jpeg' };
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  function stripReasoningTags(raw: string): string {
+    return raw
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/^<think>[\s\S]*$/i, '')
+      .trim();
+  }
+
+  async function runAnalysisWithOpenAiCompatPrimary(
+    refImageBuffer: Buffer,
+    refImageMimeType: string,
+    transcriptText: string
+  ): Promise<string> {
+    const normalized = await normalizeReferenceImageForVision(refImageBuffer);
+    const effectiveMime = normalized.mimeType || refImageMimeType;
+    const dataUrl = `data:${effectiveMime};base64,${normalized.buffer.toString('base64')}`;
+
+    const endpoint = `${OPENAI_COMPAT_ANALYSIS_BASE_URL}/chat/completions`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_COMPAT_ANALYSIS_MODEL,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `${ATF_ANALYSIS_PROMPT}\n\n---\n\n### TRANSCRIPT:\n${transcriptText}`,
+              },
+              {
+                type: 'image_url',
+                image_url: { url: dataUrl },
+              },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(120_000),
+    });
+
+    const rawBody = await response.text();
+    if (!response.ok) {
+      const compactErr = rawBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+      throw new Error(`HTTP ${response.status} ${response.statusText}${compactErr ? `: ${compactErr}` : ''}`);
+    }
+
+    let parsed: {
+      choices?: Array<{ message?: { content?: string | Array<{ text?: string }> | null } }>;
+    };
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      throw new Error('OpenAI-compatible endpoint returned non-JSON response.');
+    }
+
+    const msgContent = parsed.choices?.[0]?.message?.content;
+    const textContent =
+      typeof msgContent === 'string'
+        ? msgContent
+        : Array.isArray(msgContent)
+          ? msgContent.map((part) => part?.text || '').join('\n')
+          : '';
+
+    const cleaned = stripReasoningTags(textContent);
+    if (!cleaned) {
+      throw new Error('OpenAI-compatible endpoint returned an empty response.');
+    }
+    return cleaned;
+  }
+
+  async function runAnalysisWithGeminiFallback(
+    ai: GoogleGenAI,
+    refImageBuffer: Buffer,
+    refImageMimeType: string,
+    refImageName: string,
+    transcriptBuffer: Buffer
+  ): Promise<string> {
+    const workDir = path.join(os.tmpdir(), `cuescript_analysis_${crypto.randomBytes(6).toString('hex')}`);
+    await fs.mkdir(workDir, { recursive: true });
+
+    const refExt = refImageMimeType === 'image/png' ? '.png' : '.jpg';
+    const tempImagePath = path.join(workDir, `ATF60Stocks${refExt}`);
+    const tempTxtPath = path.join(workDir, 'transcript.txt');
+    const uploadedNames: string[] = [];
+
+    try {
+      await fs.writeFile(tempImagePath, refImageBuffer);
+      await fs.writeFile(tempTxtPath, transcriptBuffer);
+
+      const uploadedImage = await ai.files.upload({
+        file: tempImagePath,
+        config: { mimeType: refImageMimeType, displayName: refImageName },
+      });
+      if (uploadedImage.name) uploadedNames.push(uploadedImage.name);
+
+      const uploadedTxt = await ai.files.upload({
+        file: tempTxtPath,
+        config: { mimeType: 'text/plain', displayName: 'transcript.txt' },
+      });
+      if (uploadedTxt.name) uploadedNames.push(uploadedTxt.name);
+
+      if (!uploadedImage.uri || !uploadedTxt.uri) {
+        throw new Error('Gemini Files API upload did not return file URIs.');
+      }
+
+      const parts = [
+        {
+          fileData: {
+            fileUri: uploadedImage.uri,
+            mimeType: uploadedImage.mimeType || refImageMimeType,
+          },
+        },
+        {
+          fileData: {
+            fileUri: uploadedTxt.uri,
+            mimeType: uploadedTxt.mimeType || 'text/plain',
+          },
+        },
+        { text: ATF_ANALYSIS_PROMPT },
+      ];
+
+      const attempts = [
+        { model: GEMINI_MODEL, delayMs: 0 },
+        { model: GEMINI_FALLBACK_MODEL, delayMs: 1200 },
+        { model: GEMINI_FALLBACK_MODEL, delayMs: 5000 },
+      ];
+
+      let lastErr: unknown;
+      for (const attempt of attempts) {
+        if (attempt.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+        }
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: [{ role: 'user', parts }],
+          });
+          const text = (response.text || '').trim();
+          if (!text) {
+            throw new Error('Gemini analysis returned an empty response.');
+          }
+          return text;
+        } catch (err) {
+          lastErr = err;
+          if (!isTransientGeminiError(err)) {
+            throw err;
+          }
+        }
+      }
+      throw lastErr;
+    } finally {
+      for (const name of uploadedNames) {
+        await ai.files.delete({ name }).catch(() => {});
+      }
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  interface AnalysisJobRecord {
+    analysisJobId: string;
+    status: 'processing' | 'completed' | 'failed';
+    stageLabel: string;
+    createdAt: number;
+    analysis?: {
+      markdown: string;
+      engineUsed: string;
+      generatedAt: string;
+      referenceImageName: string;
+    };
+    error?: string;
+  }
+
+  const analysisJobs = new Map<string, AnalysisJobRecord>();
+  const analysisUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 15 * 1024 * 1024 },
+  });
+
+  app.get('/api/analysis/reference', (_req: Request, res: Response) => {
+    const ref = resolveAtfReferenceImage();
+    if (!ref) {
+      res.json({ ok: true, available: false });
+      return;
+    }
+    res.json({
+      ok: true,
+      available: true,
+      fileName: ref.fileName,
+      publicUrl: ref.publicUrl,
+    });
+  });
+
+  app.get('/api/analysis/reference/image', (_req: Request, res: Response) => {
+    const ref = resolveAtfReferenceImage();
+    if (!ref) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', ref.mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    createReadStream(ref.filePath).pipe(res);
+  });
+
+  app.get('/api/analyze/jobs/:jobId', (req: Request, res: Response) => {
+    const jobId = req.params.jobId || '';
+    if (!/^ana_[a-f0-9]+$/i.test(jobId)) {
+      res.status(400).json({ ok: false, message: 'Invalid analysis job identifier.' });
+      return;
+    }
+    const rec = analysisJobs.get(jobId);
+    if (!rec) {
+      res.status(404).json({ ok: false, message: 'Analysis job not found or expired.' });
+      return;
+    }
+    res.json({
+      ok: true,
+      analysisJobId: rec.analysisJobId,
+      status: rec.status,
+      stageLabel: rec.stageLabel,
+      analysis: rec.analysis,
+      error: rec.error,
+    });
+  });
+
+  app.post('/api/analyze', (req: Request, res: Response) => {
+    analysisUpload.fields([
+      { name: 'transcript', maxCount: 1 },
+      { name: 'referenceImage', maxCount: 1 },
+    ])(req, res, async (multerErr: unknown) => {
+      if (multerErr) {
+        res.status(400).json({ ok: false, message: 'Could not read uploaded transcript or image attachment.' });
+        return;
+      }
+
+      const files = (req.files || {}) as Record<string, Express.Multer.File[]>;
+      const transcriptFile = files.transcript?.[0];
+      if (!transcriptFile || transcriptFile.buffer.byteLength === 0) {
+        res.status(400).json({ ok: false, message: 'Missing generated .txt transcript file attachment.' });
+        return;
+      }
+
+      let refBuffer: Buffer;
+      let refMimeType: string;
+      let refFileName: string;
+
+      const diskRef = resolveAtfReferenceImage();
+      if (diskRef) {
+        refBuffer = await fs.readFile(diskRef.filePath);
+        refMimeType = diskRef.mimeType;
+        refFileName = diskRef.fileName;
+      } else {
+        const uploadedRef = files.referenceImage?.[0];
+        if (!uploadedRef || uploadedRef.buffer.byteLength === 0) {
+          res.status(400).json({
+            ok: false,
+            message:
+              'Reference image ATF60Stocks.jpg was not found in /public. Place ATF60Stocks.jpg in /public or attach it in the Gen AI Analysis panel.',
+          });
+          return;
+        }
+        const mime = (uploadedRef.mimetype || '').toLowerCase();
+        if (mime !== 'image/jpeg' && mime !== 'image/jpg' && mime !== 'image/png') {
+          res.status(400).json({ ok: false, message: 'Reference image must be a JPG or PNG file.' });
+          return;
+        }
+        refBuffer = uploadedRef.buffer;
+        refMimeType = mime === 'image/png' ? 'image/png' : 'image/jpeg';
+        refFileName = 'ATF60Stocks.jpg';
+      }
+
+      const now = Date.now();
+      for (const [id, item] of analysisJobs.entries()) {
+        if (now - item.createdAt > 30 * 60 * 1000) analysisJobs.delete(id);
+      }
+
+      const analysisJobId = `ana_${crypto.randomBytes(8).toString('hex')}`;
+      const record: AnalysisJobRecord = {
+        analysisJobId,
+        status: 'processing',
+        stageLabel: `Running Gen AI Analysis with OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})...`,
+        createdAt: now,
+      };
+      analysisJobs.set(analysisJobId, record);
+
+      res.status(202).json({
+        ok: true,
+        analysisJobId,
+        status: 'processing',
+      });
+
+      const transcriptBuffer = transcriptFile.buffer;
+      const transcriptText = transcriptBuffer.toString('utf-8');
+
+      void (async () => {
+        try {
+          try {
+            record.stageLabel = `Running Gen AI Analysis with OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})...`;
+            const markdown = await runAnalysisWithOpenAiCompatPrimary(
+              refBuffer,
+              refMimeType,
+              transcriptText
+            );
+            record.analysis = {
+              markdown,
+              engineUsed: `OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})`,
+              generatedAt: new Date().toISOString(),
+              referenceImageName: refFileName,
+            };
+            record.status = 'completed';
+            record.stageLabel = 'Analysis complete';
+            return;
+          } catch (primaryErr) {
+            const safeReason = primaryErr instanceof Error ? primaryErr.message.slice(0, 140) : 'primary endpoint failed';
+            console.warn(`OpenAI Gen AI Analysis failed (${safeReason}); falling back to Google Gemini.`);
+            record.stageLabel = 'Primary API unavailable — falling back to Google Gemini...';
+          }
+
+          const ai = getGeminiClient();
+          const markdown = await runAnalysisWithGeminiFallback(
+            ai,
+            refBuffer,
+            refMimeType,
+            refFileName,
+            transcriptBuffer
+          );
+          record.analysis = {
+            markdown,
+            engineUsed: 'Google Gemini fallback',
+            generatedAt: new Date().toISOString(),
+            referenceImageName: refFileName,
+          };
+          record.status = 'completed';
+          record.stageLabel = 'Analysis complete';
+        } catch (err) {
+          const mapped = formatGeminiError(err);
+          record.status = 'failed';
+          record.error = mapped.message;
+        }
+      })();
+    });
+  });
+
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
@@ -2847,6 +3433,10 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`CueScript server running on http://0.0.0.0:${PORT}`);
+    // Pre-warm standalone yt-dlp_linux ELF binary in the background so first extraction is instant
+    void ensureYtDlpBinary().catch((err) => {
+      console.warn('Background yt-dlp_linux warm-up deferred:', err instanceof Error ? err.message : err);
+    });
   });
 }
 

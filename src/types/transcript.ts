@@ -21,6 +21,13 @@ export interface TranscriptChapter {
   summary: string;
 }
 
+export interface TranscriptAnalysisResult {
+  markdown: string;
+  engineUsed: string;
+  generatedAt: string;
+  referenceImageName: string;
+}
+
 export interface TranscriptJob {
   id: string;
   createdAt: string;
@@ -45,6 +52,7 @@ export interface TranscriptJob {
   chapters: TranscriptChapter[];
   segments: TranscriptSegment[];
   extractionMethod: string;
+  analysis?: TranscriptAnalysisResult;
 }
 
 export interface TranscribeApiSuccess {
@@ -87,6 +95,15 @@ export interface AsyncJobPollResponse {
   error?: TranscribeApiError;
 }
 
+export interface AnalysisPollResponse {
+  ok: true;
+  analysisJobId: string;
+  status: 'processing' | 'completed' | 'failed';
+  stageLabel: string;
+  analysis?: TranscriptAnalysisResult;
+  error?: string;
+}
+
 export type TranscribeApiResponse = TranscribeApiSuccess | AsyncJobAccepted | TranscribeApiError;
 
-export type AppView = 'studio' | 'architecture' | 'platforms' | 'estimator';
+export type AppView = 'studio' | 'analysis';

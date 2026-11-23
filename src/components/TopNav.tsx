@@ -8,9 +8,7 @@ interface TopNavProps {
 
 const NAV_ITEMS: Array<{ id: AppView; label: string }> = [
   { id: 'studio', label: 'Studio' },
-  { id: 'architecture', label: 'Architecture' },
-  { id: 'platforms', label: 'Platforms' },
-  { id: 'estimator', label: 'Cost Estimator' },
+  { id: 'analysis', label: 'Gen AI Analysis' },
 ];
 
 export function TopNav({ activeView, onSelectView, onNewTranscript }: TopNavProps) {
@@ -29,7 +27,7 @@ export function TopNav({ activeView, onSelectView, onNewTranscript }: TopNavProp
         {/* Zone 2: Concise single-line text navigation links */}
         <nav
           aria-label="Primary navigation"
-          className="flex items-center gap-5 overflow-x-auto sm:gap-7"
+          className="flex h-full items-center gap-5 sm:gap-7"
         >
           {NAV_ITEMS.map((item) => {
             const isActive = activeView === item.id;
@@ -39,7 +37,7 @@ export function TopNav({ activeView, onSelectView, onNewTranscript }: TopNavProp
                 type="button"
                 onClick={() => onSelectView(item.id)}
                 aria-current={isActive ? 'page' : undefined}
-                className={`relative shrink-0 whitespace-nowrap py-1 text-sm font-medium transition-colors duration-150 cursor-pointer ${
+                className={`relative flex h-full shrink-0 items-center whitespace-nowrap text-sm font-medium transition-colors duration-150 cursor-pointer ${
                   isActive
                     ? 'text-[#0F172A]'
                     : 'text-[#475569] hover:text-[#0F172A]'
@@ -49,7 +47,7 @@ export function TopNav({ activeView, onSelectView, onNewTranscript }: TopNavProp
                 {isActive && (
                   <span
                     aria-hidden="true"
-                    className="absolute inset-x-0 -bottom-[21px] h-[2px] bg-[#E11D48]"
+                    className="absolute inset-x-0 bottom-0 h-[2px] bg-[#E11D48]"
                   />
                 )}
               </button>
