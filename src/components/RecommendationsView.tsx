@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   ArrowRight,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Download,
   FileSpreadsheet,
@@ -256,6 +258,7 @@ export function RecommendationsView({
   const [displayMode, setDisplayMode] = useState<'tables' | 'markdown'>('tables');
   const [copied, setCopied] = useState(false);
   const [showSourcesList, setShowSourcesList] = useState(false);
+  const [isSourcesExpanded, setIsSourcesExpanded] = useState(false);
 
   const pollCancelledRef = useRef(false);
 
@@ -487,47 +490,83 @@ export function RecommendationsView({
         </div>
       </section>
 
-      {/* Main 12-Column Split Workspace */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Left: Analyzed Videos Source Selector */}
-        <aside className="lg:col-span-4">
-          <div className="rounded-xl border border-[#E2E8F0] bg-white p-4">
-            <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-3">
-              <div>
-                <h2 className="text-sm font-semibold text-[#0F172A]">
-                  Analyzed Sources
-                </h2>
-                <p className="mt-0.5 text-xs text-[#64748B]">
-                  <span className="font-mono tabular-nums text-[#0F172A]">{analyzedJobs.length}</span> of{' '}
-                  <span className="font-mono tabular-nums">{jobs.length}</span> videos have{' '}
-                  <span className="font-mono">analysis.md</span>
-                </p>
-              </div>
-              {analyzedJobs.length > 0 && (
-                <div className="flex items-center gap-2 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setSelectedJobIds(analyzedJobs.map((j) => j.id))}
-                    className="font-medium text-[#0F172A] hover:text-[#E11D48] cursor-pointer"
-                  >
-                    All
-                  </button>
-                  <span className="text-[#CBD5E1]" aria-hidden="true">
-                    /
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedJobIds([])}
-                    className="font-medium text-[#64748B] hover:text-[#0F172A] cursor-pointer"
-                  >
-                    Clear
-                  </button>
-                </div>
+      {/* Collapsible Analyzed Sources Bar (collapsed by default to maximize table space) */}
+      <section className="rounded-xl border border-[#E2E8F0] bg-white">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+          <button
+            type="button"
+            aria-expanded={isSourcesExpanded}
+            aria-controls="analyzed-sources-panel"
+            onClick={() => setIsSourcesExpanded((v) => !v)}
+            className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1 text-left cursor-pointer"
+          >
+            <span className="text-sm font-semibold text-[#0F172A]">Analyzed Sources</span>
+            <span className="text-xs text-[#64748B]">
+              <span className="font-mono font-medium tabular-nums text-[#0F172A]">
+                {selectedJobs.length}
+              </span>{' '}
+              of{' '}
+              <span className="font-mono tabular-nums text-[#0F172A]">{analyzedJobs.length}</span>{' '}
+              selected
+              {unanalyzedCount > 0 && (
+                <>
+                  {' '}
+                  · <span className="font-mono tabular-nums">{unanalyzedCount}</span> without{' '}
+                  <span className="font-mono">analysis.md</span> skipped
+                </>
               )}
-            </div>
+            </span>
+          </button>
 
+          <div className="flex shrink-0 items-center gap-3">
+            {isSourcesExpanded && analyzedJobs.length > 0 && (
+              <div className="flex items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setSelectedJobIds(analyzedJobs.map((j) => j.id))}
+                  className="font-medium text-[#0F172A] hover:text-[#E11D48] cursor-pointer"
+                >
+                  All
+                </button>
+                <span className="text-[#CBD5E1]" aria-hidden="true">
+                  /
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedJobIds([])}
+                  className="font-medium text-[#64748B] hover:text-[#0F172A] cursor-pointer"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              aria-expanded={isSourcesExpanded}
+              aria-controls="analyzed-sources-panel"
+              onClick={() => setIsSourcesExpanded((v) => !v)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1 text-xs font-medium text-[#334155] transition-colors hover:border-[#94A3B8] hover:text-[#0F172A] cursor-pointer"
+            >
+              {isSourcesExpanded ? (
+                <>
+                  Hide
+                  <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                </>
+              ) : (
+                <>
+                  Select files
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {isSourcesExpanded && (
+          <div id="analyzed-sources-panel" className="border-t border-[#E2E8F0] px-5 py-4">
             {analyzedJobs.length === 0 ? (
-              <div className="mt-4 rounded-lg border border-dashed border-[#CBD5E1] bg-[#F8FAFC] p-5 text-center">
+              <div className="rounded-lg border border-dashed border-[#CBD5E1] bg-[#F8FAFC] p-5 text-center">
                 <Sparkles className="mx-auto h-5 w-5 text-[#475569]" aria-hidden="true" />
                 <p className="mt-2.5 text-xs font-medium text-[#0F172A]">
                   No analysis.md files available yet
@@ -545,66 +584,57 @@ export function RecommendationsView({
                 </button>
               </div>
             ) : (
-              <>
-                <div className="mt-3 max-h-[540px] space-y-2 overflow-y-auto pr-0.5">
-                  {analyzedJobs.map((job) => {
-                    const checked = selectedJobIds.includes(job.id);
-                    const sourceLabel = job.driveFolderName?.trim() || truncateTitle(job.title, 48);
-                    return (
-                      <label
-                        key={job.id}
-                        title={job.driveFolderName || job.title}
-                        className={`flex items-start gap-3 rounded-lg border p-3 transition-colors cursor-pointer ${
-                          checked
-                            ? 'border-[#0F172A] bg-[#F8FAFC]'
-                            : 'border-[#E2E8F0] bg-white hover:border-[#94A3B8]'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleJobSelection(job.id)}
-                          disabled={isGenerating}
-                          className="mt-0.5 h-4 w-4 shrink-0 rounded border-[#CBD5E1] accent-[#0F172A] cursor-pointer"
-                        />
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-xs font-medium text-[#0F172A]">
-                            {truncateTitle(sourceLabel, 52)}
-                          </p>
-                          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-[#64748B]">
-                            <span>{getSourceShortLabel(job.sourceType)}</span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-mono">analysis.md</span>
-                            {job.driveTranscriptFileIds?.analysisMdId && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="inline-flex items-center gap-1 text-[#15803D]">
-                                  <HardDrive className="h-2.5 w-2.5" aria-hidden="true" />
-                                  Drive
-                                </span>
-                              </>
-                            )}
-                          </div>
+              <div className="grid max-h-[320px] grid-cols-1 gap-2.5 overflow-y-auto pr-0.5 sm:grid-cols-2 lg:grid-cols-3">
+                {analyzedJobs.map((job) => {
+                  const checked = selectedJobIds.includes(job.id);
+                  const sourceLabel = job.driveFolderName?.trim() || truncateTitle(job.title, 48);
+                  return (
+                    <label
+                      key={job.id}
+                      title={job.driveFolderName || job.title}
+                      className={`flex items-start gap-2.5 rounded-lg border p-2.5 transition-colors cursor-pointer ${
+                        checked
+                          ? 'border-[#0F172A] bg-[#F8FAFC]'
+                          : 'border-[#E2E8F0] bg-white hover:border-[#94A3B8]'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleJobSelection(job.id)}
+                        disabled={isGenerating}
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-[#CBD5E1] accent-[#0F172A] cursor-pointer"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs font-medium text-[#0F172A]">
+                          {truncateTitle(sourceLabel, 48)}
+                        </p>
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-[#64748B]">
+                          <span>{getSourceShortLabel(job.sourceType)}</span>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono">analysis.md</span>
+                          {job.driveTranscriptFileIds?.analysisMdId && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="inline-flex items-center gap-1 text-[#15803D]">
+                                <HardDrive className="h-2.5 w-2.5" aria-hidden="true" />
+                                Drive
+                              </span>
+                            </>
+                          )}
                         </div>
-                      </label>
-                    );
-                  })}
-                </div>
-
-                {unanalyzedCount > 0 && (
-                  <p className="mt-3 border-t border-[#F1F5F9] pt-3 text-[11px] text-[#64748B]">
-                    {unanalyzedCount} transcribed {unanalyzedCount === 1 ? 'video' : 'videos'} without{' '}
-                    <span className="font-mono">analysis.md</span> automatically skipped.
-                  </p>
-                )}
-              </>
+                      </div>
+                    </label>
+                  );
+                })}
+              </div>
             )}
           </div>
-        </aside>
+        )}
+      </section>
 
-        {/* Right: Latest Recommendations Viewport */}
-        <section className="lg:col-span-8">
-          <div className="rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6">
+      {/* Full-Width Latest Recommendations Viewport */}
+      <section className="rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6">
             {/* Bridge update or sync warning (non-blocking) */}
             {showBridgeWarning && (
               <div
@@ -1008,9 +1038,7 @@ export function RecommendationsView({
                 </div>
               </div>
             )}
-          </div>
-        </section>
-      </div>
+      </section>
     </div>
   );
 }
