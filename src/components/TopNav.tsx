@@ -9,6 +9,7 @@ interface TopNavProps {
 const NAV_ITEMS: Array<{ id: AppView; label: string }> = [
   { id: 'studio', label: 'Studio' },
   { id: 'analysis', label: 'Gen AI Analysis' },
+  { id: 'recommendations', label: 'Recommendations' },
 ];
 
 export function TopNav({ activeView, onSelectView, onNewTranscript }: TopNavProps) {

@@ -96,6 +96,71 @@ export interface DrivePingResult {
   error?: string;
 }
 
+export interface RecommendationSourceRefPayload {
+  videoTitle: string;
+  sourceFileName: string;
+  timestamps: string[];
+  specificNotes?: string;
+}
+
+export interface RecommendationEntryPayload {
+  stock: string;
+  atfNumber: string | null;
+  category: 'strong_buy' | 'swing_trade';
+  entryAndDipLevels: string;
+  targetsAndStopLoss: string;
+  horizonAndGuidance: string;
+  hasLevelConflict: boolean;
+  sources: RecommendationSourceRefPayload[];
+}
+
+export interface RecommendationSourceFilePayload {
+  jobId?: string;
+  sourceKey?: string;
+  title: string;
+  folderName?: string;
+  fileName: string;
+}
+
+export interface RecommendationDriveFilesPayload {
+  folderId?: string;
+  mdFileId?: string;
+  jsonFileId?: string;
+  mdFileName?: string;
+  jsonFileName?: string;
+}
+
+export interface RecommendationSnapshotPayload {
+  id: string;
+  generatedAt: string;
+  formattedTimestamp: string;
+  fileBaseName: string;
+  engineUsed: string;
+  sourceVideos: RecommendationSourceFilePayload[];
+  executiveSummary: string;
+  strongBuys: RecommendationEntryPayload[];
+  swingTrades: RecommendationEntryPayload[];
+  markdown: string;
+  driveFiles?: RecommendationDriveFilesPayload;
+  syncedToDrive?: boolean;
+  driveSyncWarning?: string;
+}
+
+export function formatRecommendationTimestamp(date: Date = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || '00';
+  return `${get('day')}/${get('month')}/${get('year')} ${get('hour')}:${get('minute')}:${get('second')}`;
+}
+
 export function getSourceShortLabel(
   sourceType: DriveJobPayload['sourceType'] | string | undefined
 ): string {
@@ -850,6 +915,177 @@ export async function trashDriveEntry(sourceKey: string): Promise<{ trashedCount
   return { trashedCount: res.trashedCount ?? 0 };
 }
 
+export function isUnknownBridgeActionError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /unknown action/i.test(msg);
+}
+
+export async function saveRecommendationToDrive(
+  snapshot: RecommendationSnapshotPayload
+): Promise<{
+  ok: boolean;
+  needsBridgeUpdate?: boolean;
+  error?: string;
+  driveFiles?: RecommendationDriveFilesPayload;
+  syncedAt?: string;
+}> {
+  const fileBaseName =
+    snapshot.fileBaseName?.trim() || `Recommendations_${snapshot.formattedTimestamp}`;
+
+  const jsonPayload: RecommendationSnapshotPayload = {
+    ...snapshot,
+    fileBaseName,
+    syncedToDrive: true,
+    driveSyncWarning: undefined,
+  };
+
+  try {
+    const res = await callDriveBridge<{
+      ok: true;
+      folderId?: string;
+      folderName?: string;
+      mdFileId?: string;
+      jsonFileId?: string;
+      mdFileName?: string;
+      jsonFileName?: string;
+      syncedAt?: string;
+    }>(
+      {
+        action: 'saveRecommendation',
+        fileBaseName,
+        formattedTimestamp: snapshot.formattedTimestamp,
+        mdText: snapshot.markdown,
+        jsonText: JSON.stringify(jsonPayload, null, 2),
+      },
+      45_000
+    );
+
+    return {
+      ok: true,
+      driveFiles: {
+        folderId: res.folderId,
+        mdFileId: res.mdFileId,
+        jsonFileId: res.jsonFileId,
+        mdFileName: res.mdFileName || `${fileBaseName}.md`,
+        jsonFileName: res.jsonFileName || `${fileBaseName}.json`,
+      },
+      syncedAt: res.syncedAt || new Date().toISOString(),
+    };
+  } catch (err) {
+    if (isUnknownBridgeActionError(err)) {
+      return {
+        ok: false,
+        needsBridgeUpdate: true,
+        error:
+          'Your deployed Apps Script Drive Bridge needs a quick update to save CueScript/Recommendations/ files. Open Drive Setup, copy the updated Code.gs, and deploy a New Version.',
+      };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Could not save recommendation to Google Drive.',
+    };
+  }
+}
+
+export async function getLatestRecommendationFromDrive(): Promise<{
+  ok: boolean;
+  hasRecommendation: boolean;
+  needsBridgeUpdate?: boolean;
+  recommendation?: RecommendationSnapshotPayload;
+  error?: string;
+}> {
+  try {
+    const res = await callDriveBridge<{
+      ok: true;
+      hasRecommendation?: boolean;
+      folderId?: string;
+      jsonText?: string | null;
+      mdText?: string | null;
+      jsonFileId?: string;
+      mdFileId?: string;
+      jsonFileName?: string;
+      mdFileName?: string;
+      modifiedTime?: string;
+    }>({ action: 'getLatestRecommendation' }, 30_000);
+
+    if (!res.hasRecommendation) {
+      return { ok: true, hasRecommendation: false };
+    }
+
+    if (typeof res.jsonText === 'string' && res.jsonText.trim()) {
+      try {
+        const parsed = JSON.parse(res.jsonText) as RecommendationSnapshotPayload;
+        if (parsed && Array.isArray(parsed.strongBuys) && Array.isArray(parsed.swingTrades)) {
+          const driveFiles: RecommendationDriveFilesPayload = {
+            folderId: res.folderId || parsed.driveFiles?.folderId,
+            mdFileId: res.mdFileId || parsed.driveFiles?.mdFileId,
+            jsonFileId: res.jsonFileId || parsed.driveFiles?.jsonFileId,
+            mdFileName: res.mdFileName || parsed.driveFiles?.mdFileName,
+            jsonFileName: res.jsonFileName || parsed.driveFiles?.jsonFileName,
+          };
+          return {
+            ok: true,
+            hasRecommendation: true,
+            recommendation: {
+              ...parsed,
+              markdown: parsed.markdown || res.mdText || '',
+              driveFiles,
+              syncedToDrive: true,
+              driveSyncWarning: undefined,
+            },
+          };
+        }
+      } catch {
+        // Fall through to markdown-only hydration below if JSON was malformed
+      }
+    }
+
+    if (typeof res.mdText === 'string' && res.mdText.trim()) {
+      const baseName = (res.mdFileName || 'Recommendations').replace(/\.md$/i, '');
+      const tsMatch = baseName.replace(/^Recommendations_/i, '');
+      return {
+        ok: true,
+        hasRecommendation: true,
+        recommendation: {
+          id: `drive_${res.mdFileId || Date.now()}`,
+          generatedAt: res.modifiedTime || new Date().toISOString(),
+          formattedTimestamp: tsMatch || formatRecommendationTimestamp(),
+          fileBaseName: baseName,
+          engineUsed: 'Loaded from Google Drive',
+          sourceVideos: [],
+          executiveSummary: 'Loaded latest archived Recommendations markdown from Google Drive.',
+          strongBuys: [],
+          swingTrades: [],
+          markdown: res.mdText,
+          driveFiles: {
+            folderId: res.folderId,
+            mdFileId: res.mdFileId,
+            mdFileName: res.mdFileName,
+          },
+          syncedToDrive: true,
+        },
+      };
+    }
+
+    return { ok: true, hasRecommendation: false };
+  } catch (err) {
+    if (isUnknownBridgeActionError(err)) {
+      return {
+        ok: false,
+        hasRecommendation: false,
+        needsBridgeUpdate: true,
+        error:
+          'Update your Apps Script Code.gs from Drive Setup (Deploy -> New Version) to load archived recommendations from CueScript/Recommendations/.',
+      };
+    }
+    return {
+      ok: false,
+      hasRecommendation: false,
+      error: err instanceof Error ? err.message : 'Unable to fetch latest recommendation from Drive.',
+    };
+  }
+}
+
 export const APPS_SCRIPT_MANIFEST_JSON = `{
   "timeZone": "Asia/Kolkata",
   "dependencies": {
@@ -887,11 +1123,15 @@ export const APPS_SCRIPT_BRIDGE_CODE = `/**
  *     │     ├── transcript.srt
  *     │     ├── transcript.txt
  *     │     └── analysis.md (when Gen AI Analysis is run)
- *     └── Insta - <Title up to 50 chars>/
- *           └── ...
+ *     ├── Insta - <Title up to 50 chars>/
+ *     │     └── ...
+ *     └── Recommendations/
+ *           ├── Recommendations_dd/mm/yyyy HH:MM:SS.md
+ *           └── Recommendations_dd/mm/yyyy HH:MM:SS.json
  */
 
 var ROOT_FOLDER_NAME = 'CueScript';
+var RECOMMENDATIONS_FOLDER_NAME = 'Recommendations';
 var LEGACY_AUDIO_FOLDER_NAME = 'Audio';
 var LEGACY_TRANSCRIPTS_FOLDER_NAME = 'Transcripts';
 var DRIVE_API = 'https://www.googleapis.com/drive/v3';
@@ -1086,11 +1326,49 @@ function findLegacySubfolder(rootId, folderName) {
   var matches = listFilesByQuery(q, 5, null);
   for (var i = 0; i < matches.length; i++) {
     var ap = matches[i].appProperties || {};
-    if (!ap.cuescriptSourceKey) {
+    if (!ap.cuescriptSourceKey && ap.cuescriptType !== 'recommendations_folder') {
       return matches[i];
     }
   }
   return null;
+}
+
+function findRecommendationsFolder(rootId) {
+  var qByProp =
+    "'" + escapeQueryValue(rootId) + "' in parents" +
+    " and mimeType = 'application/vnd.google-apps.folder'" +
+    " and trashed = false" +
+    " and appProperties has { key='cuescriptType' and value='recommendations_folder' }";
+  var propMatches = listFilesByQuery(qByProp, 5, 'modifiedTime desc');
+  if (propMatches.length > 0) return propMatches[0];
+
+  var qByName =
+    "'" + escapeQueryValue(rootId) + "' in parents" +
+    " and name = '" + escapeQueryValue(RECOMMENDATIONS_FOLDER_NAME) + "'" +
+    " and mimeType = 'application/vnd.google-apps.folder'" +
+    " and trashed = false";
+  var nameMatches = listFilesByQuery(qByName, 5, 'modifiedTime desc');
+  return nameMatches.length > 0 ? nameMatches[0] : null;
+}
+
+function getOrCreateRecommendationsFolder(rootId) {
+  var existing = findRecommendationsFolder(rootId);
+  if (existing) {
+    return { id: existing.id, name: existing.name };
+  }
+  var created = driveJson(DRIVE_API + '/files?fields=id,name', {
+    method: 'post',
+    contentType: 'application/json; charset=UTF-8',
+    payload: JSON.stringify({
+      name: RECOMMENDATIONS_FOLDER_NAME,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [rootId],
+      appProperties: {
+        cuescriptType: 'recommendations_folder'
+      }
+    })
+  });
+  return { id: created.id, name: created.name };
 }
 
 function isSafeKey(key) {
@@ -1595,6 +1873,97 @@ function doPost(e) {
       }
 
       return jsonOut({ ok: true, trashedCount: trashedCount });
+    }
+
+    if (action === 'saveRecommendation') {
+      var rawBaseName = String(body.fileBaseName || '').trim();
+      if (!rawBaseName || rawBaseName.length > 90 || rawBaseName.indexOf('Recommendations_') !== 0) {
+        return jsonOut({ ok: false, error: 'Invalid recommendation fileBaseName.' });
+      }
+      var safeBaseName = rawBaseName.replace(/[\\r\\n\\t]+/g, ' ').trim();
+      var recFolder = getOrCreateRecommendationsFolder(rootId);
+
+      var mdFileName = safeBaseName + '.md';
+      var jsonFileName = safeBaseName + '.json';
+      var mdBytes = Utilities.newBlob(String(body.mdText || ''), 'text/markdown').getBytes();
+      var jsonBytes = Utilities.newBlob(String(body.jsonText || '{}'), 'application/json').getBytes();
+
+      var savedMd = uploadResumableBytes(recFolder.id, mdFileName, 'text/markdown', mdBytes, null, {
+        cuescriptRole: 'recommendation_md',
+        cuescriptRecBaseName: safeBaseName
+      });
+      var savedJson = uploadResumableBytes(recFolder.id, jsonFileName, 'application/json', jsonBytes, null, {
+        cuescriptRole: 'recommendation_json',
+        cuescriptRecBaseName: safeBaseName
+      });
+
+      return jsonOut({
+        ok: true,
+        folderId: recFolder.id,
+        folderName: recFolder.name,
+        mdFileId: savedMd.id,
+        jsonFileId: savedJson.id,
+        mdFileName: savedMd.name || mdFileName,
+        jsonFileName: savedJson.name || jsonFileName,
+        syncedAt: savedJson.modifiedTime || savedMd.modifiedTime || new Date().toISOString()
+      });
+    }
+
+    if (action === 'getLatestRecommendation') {
+      var existingRecFolder = findRecommendationsFolder(rootId);
+      if (!existingRecFolder) {
+        return jsonOut({ ok: true, hasRecommendation: false });
+      }
+      var recFiles = listFilesInFolder(existingRecFolder.id, null, 40);
+      if (!recFiles || recFiles.length === 0) {
+        return jsonOut({ ok: true, hasRecommendation: false });
+      }
+
+      var latestJson = null;
+      var latestMd = null;
+      for (var rIdx = 0; rIdx < recFiles.length; rIdx++) {
+        var rf = recFiles[rIdx];
+        var rRole = (rf.appProperties && rf.appProperties.cuescriptRole) || '';
+        var rName = String(rf.name || '').toLowerCase();
+        if (!latestJson && (rRole === 'recommendation_json' || rName.slice(-5) === '.json')) {
+          latestJson = rf;
+        } else if (!latestMd && (rRole === 'recommendation_md' || rName.slice(-3) === '.md')) {
+          latestMd = rf;
+        }
+        if (latestJson && latestMd) break;
+      }
+
+      if (!latestJson && !latestMd) {
+        return jsonOut({ ok: true, hasRecommendation: false });
+      }
+
+      // If we found a latest JSON, try to pair its matching .md file by base name
+      if (latestJson) {
+        var jsonBase = (latestJson.appProperties && latestJson.appProperties.cuescriptRecBaseName) ||
+          String(latestJson.name || '').replace(/\\.json$/i, '');
+        for (var mIdx = 0; mIdx < recFiles.length; mIdx++) {
+          var cand = recFiles[mIdx];
+          var cBase = (cand.appProperties && cand.appProperties.cuescriptRecBaseName) ||
+            String(cand.name || '').replace(/\\.md$/i, '');
+          if (String(cand.name || '').toLowerCase().slice(-3) === '.md' && cBase === jsonBase) {
+            latestMd = cand;
+            break;
+          }
+        }
+      }
+
+      return jsonOut({
+        ok: true,
+        hasRecommendation: true,
+        folderId: existingRecFolder.id,
+        jsonFileId: latestJson ? latestJson.id : undefined,
+        jsonFileName: latestJson ? latestJson.name : undefined,
+        mdFileId: latestMd ? latestMd.id : undefined,
+        mdFileName: latestMd ? latestMd.name : undefined,
+        jsonText: latestJson ? downloadFileText(latestJson.id) : null,
+        mdText: latestMd ? downloadFileText(latestMd.id) : null,
+        modifiedTime: (latestJson && latestJson.modifiedTime) || (latestMd && latestMd.modifiedTime) || new Date().toISOString()
+      });
     }
 
     return jsonOut({ ok: false, error: 'Unknown action: ' + String(action) });

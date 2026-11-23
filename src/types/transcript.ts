@@ -141,6 +141,65 @@ export interface AnalysisPollResponse {
   error?: string;
 }
 
+export interface RecommendationSourceRef {
+  videoTitle: string;
+  sourceFileName: string;
+  timestamps: string[];
+  specificNotes?: string;
+}
+
+export interface RecommendationEntry {
+  stock: string;
+  atfNumber: string | null;
+  category: 'strong_buy' | 'swing_trade';
+  entryAndDipLevels: string;
+  targetsAndStopLoss: string;
+  horizonAndGuidance: string;
+  hasLevelConflict: boolean;
+  sources: RecommendationSourceRef[];
+}
+
+export interface RecommendationSourceFile {
+  jobId?: string;
+  sourceKey?: string;
+  title: string;
+  folderName?: string;
+  fileName: string;
+}
+
+export interface RecommendationDriveFiles {
+  folderId?: string;
+  mdFileId?: string;
+  jsonFileId?: string;
+  mdFileName?: string;
+  jsonFileName?: string;
+}
+
+export interface RecommendationSnapshot {
+  id: string;
+  generatedAt: string;
+  formattedTimestamp: string;
+  fileBaseName: string;
+  engineUsed: string;
+  sourceVideos: RecommendationSourceFile[];
+  executiveSummary: string;
+  strongBuys: RecommendationEntry[];
+  swingTrades: RecommendationEntry[];
+  markdown: string;
+  driveFiles?: RecommendationDriveFiles;
+  syncedToDrive?: boolean;
+  driveSyncWarning?: string;
+}
+
+export interface RecommendationPollResponse {
+  ok: true;
+  recommendationJobId: string;
+  status: 'processing' | 'completed' | 'failed';
+  stageLabel: string;
+  recommendation?: RecommendationSnapshot;
+  error?: string;
+}
+
 export type TranscribeApiResponse = TranscribeApiSuccess | AsyncJobAccepted | TranscribeApiError;
 
-export type AppView = 'studio' | 'analysis';
+export type AppView = 'studio' | 'analysis' | 'recommendations';

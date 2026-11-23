@@ -3,6 +3,7 @@ import { ArrowRight, HardDrive, Sparkles } from 'lucide-react';
 import { DriveSetupModal } from './components/DriveSetupModal';
 import { GenAiAnalysisView } from './components/GenAiAnalysisView';
 import { IngestPanel } from './components/IngestPanel';
+import { RecommendationsView } from './components/RecommendationsView';
 import { StudioWorkspace } from './components/StudioWorkspace';
 import { TopNav } from './components/TopNav';
 import type {
@@ -10,6 +11,7 @@ import type {
   AsyncJobPollResponse,
   DriveStatusResponse,
   MediaPlatform,
+  RecommendationSnapshot,
   RefreshMode,
   TranscribeApiError,
   TranscribeApiResponse,
@@ -19,6 +21,21 @@ import type {
 import { formatDisplayTimestamp, truncateTitle } from './utils/exporters';
 
 const JOBS_STORAGE_KEY = 'cuescript_jobs_v1';
+const LATEST_REC_STORAGE_KEY = 'cuescript_latest_recommendation_v1';
+
+function loadStoredRecommendation(): RecommendationSnapshot | null {
+  try {
+    const raw = localStorage.getItem(LATEST_REC_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RecommendationSnapshot;
+    if (parsed && typeof parsed.markdown === 'string' && typeof parsed.formattedTimestamp === 'string') {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 function loadStoredJobs(): TranscriptJob[] {
   try {
@@ -89,6 +106,13 @@ export default function App() {
   const [isVerifyingDrive, setIsVerifyingDrive] = useState(false);
   const [isSetupModalOpen, setIsSetupModalOpen] = useState(false);
 
+  // Latest consolidated stock recommendations (cached locally + synced with CueScript/Recommendations/ in Drive)
+  const [latestRecommendation, setLatestRecommendation] = useState<RecommendationSnapshot | null>(
+    loadStoredRecommendation
+  );
+  const [isLoadingLatestRec, setIsLoadingLatestRec] = useState(false);
+  const [driveRecNeedsBridgeUpdate, setDriveRecNeedsBridgeUpdate] = useState(false);
+
   // Studio inline transcript refresh state
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshDetail, setRefreshDetail] = useState('');
@@ -112,12 +136,57 @@ export default function App() {
     }
   }, [jobs]);
 
+  useEffect(() => {
+    try {
+      if (latestRecommendation) {
+        localStorage.setItem(LATEST_REC_STORAGE_KEY, JSON.stringify(latestRecommendation));
+      }
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [latestRecommendation]);
+
   const buildDriveHeaders = useCallback(
     (tokenOverride?: string | null): Record<string, string> => {
       const token = tokenOverride !== undefined ? tokenOverride : driveSessionToken;
       return token ? { Authorization: `Bearer ${token}` } : {};
     },
     [driveSessionToken]
+  );
+
+  const fetchLatestRecommendationFromDrive = useCallback(
+    async (tokenOverride?: string | null) => {
+      setIsLoadingLatestRec(true);
+      try {
+        const headers = buildDriveHeaders(tokenOverride);
+        const res = await fetch('/api/recommendations/latest', { headers });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          ok: boolean;
+          hasRecommendation?: boolean;
+          needsBridgeUpdate?: boolean;
+          recommendation?: RecommendationSnapshot;
+        };
+        setDriveRecNeedsBridgeUpdate(Boolean(data.needsBridgeUpdate));
+        if (data.ok && data.hasRecommendation && data.recommendation) {
+          const driveRec = data.recommendation;
+          setLatestRecommendation((prev) => {
+            if (!prev) return driveRec;
+            const prevTime = new Date(prev.generatedAt).getTime();
+            const driveTime = new Date(driveRec.generatedAt).getTime();
+            if (!Number.isFinite(prevTime) || driveTime >= prevTime) {
+              return driveRec;
+            }
+            return prev;
+          });
+        }
+      } catch {
+        // Keep locally cached latest recommendation on transient error
+      } finally {
+        setIsLoadingLatestRec(false);
+      }
+    },
+    [buildDriveHeaders]
   );
 
   const fetchDriveStatusAndLibrary = useCallback(
@@ -133,18 +202,23 @@ export default function App() {
         if (statusData.configured && statusData.unlocked && statusData.reachable) {
           setIsSyncingLibrary(true);
           try {
-            const libRes = await fetch('/api/drive/library', { headers });
-            if (libRes.ok) {
-              const libData = (await libRes.json()) as { ok: true; jobs?: TranscriptJob[] };
-              const driveJobs = Array.isArray(libData.jobs) ? libData.jobs : [];
-              if (driveJobs.length > 0) {
-                setJobs((prev) => {
-                  const merged = mergeJobLists(driveJobs, prev);
-                  setActiveJobId((currId) => currId ?? merged[0]?.id ?? null);
-                  return merged;
-                });
-              }
-            }
+            const libPromise = fetch('/api/drive/library', { headers })
+              .then(async (libRes) => {
+                if (!libRes.ok) return;
+                const libData = (await libRes.json()) as { ok: true; jobs?: TranscriptJob[] };
+                const driveJobs = Array.isArray(libData.jobs) ? libData.jobs : [];
+                if (driveJobs.length > 0) {
+                  setJobs((prev) => {
+                    const merged = mergeJobLists(driveJobs, prev);
+                    setActiveJobId((currId) => currId ?? merged[0]?.id ?? null);
+                    return merged;
+                  });
+                }
+              })
+              .catch(() => {});
+
+            const recPromise = fetchLatestRecommendationFromDrive(tokenOverride);
+            await Promise.all([libPromise, recPromise]);
           } finally {
             setIsSyncingLibrary(false);
           }
@@ -155,7 +229,7 @@ export default function App() {
         setIsVerifyingDrive(false);
       }
     },
-    [buildDriveHeaders]
+    [buildDriveHeaders, fetchLatestRecommendationFromDrive]
   );
 
   useEffect(() => {
@@ -536,6 +610,63 @@ export default function App() {
     });
   }
 
+  function handleRecommendationGenerated(snapshot: RecommendationSnapshot) {
+    setLatestRecommendation(snapshot);
+    if (snapshot.syncedToDrive) {
+      setDriveRecNeedsBridgeUpdate(false);
+    } else if (snapshot.driveSyncWarning && /code\.gs|bridge/i.test(snapshot.driveSyncWarning)) {
+      setDriveRecNeedsBridgeUpdate(true);
+    }
+  }
+
+  async function handleSyncRecommendationToDrive(snapshot: RecommendationSnapshot): Promise<{
+    ok: boolean;
+    needsBridgeUpdate?: boolean;
+    error?: string;
+  }> {
+    try {
+      const res = await fetch('/api/recommendations/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...buildDriveHeaders(),
+        },
+        body: JSON.stringify({ recommendation: snapshot }),
+      });
+      const data = (await res.json()) as {
+        ok: boolean;
+        needsBridgeUpdate?: boolean;
+        message?: string;
+        driveFiles?: RecommendationSnapshot['driveFiles'];
+      };
+      if (!res.ok || !data.ok) {
+        if (data.needsBridgeUpdate) setDriveRecNeedsBridgeUpdate(true);
+        return {
+          ok: false,
+          needsBridgeUpdate: data.needsBridgeUpdate,
+          error: data.message || 'Could not save recommendation to Drive.',
+        };
+      }
+      setDriveRecNeedsBridgeUpdate(false);
+      setLatestRecommendation((prev) =>
+        prev && prev.id === snapshot.id
+          ? {
+              ...prev,
+              syncedToDrive: true,
+              driveFiles: data.driveFiles || prev.driveFiles,
+              driveSyncWarning: undefined,
+            }
+          : prev
+      );
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Network error syncing to Google Drive.',
+      };
+    }
+  }
+
   async function handleDeleteJob(jobId: string, deleteFromDrive: boolean) {
     const target = jobs.find((j) => j.id === jobId);
     if (deleteFromDrive && target?.sourceKey && driveStatus?.configured && driveStatus.unlocked) {
@@ -702,6 +833,22 @@ export default function App() {
             onSyncJobToDrive={handleSyncJobToDrive}
             driveEnabled={driveEnabled}
             onGoToStudio={() => setActiveView('studio')}
+          />
+        )}
+
+        {activeView === 'recommendations' && (
+          <RecommendationsView
+            jobs={jobs}
+            latestRecommendation={latestRecommendation}
+            isLoadingLatest={isLoadingLatestRec}
+            driveEnabled={driveEnabled}
+            driveNeedsBridgeUpdate={driveRecNeedsBridgeUpdate}
+            buildDriveHeaders={buildDriveHeaders}
+            onRecommendationGenerated={handleRecommendationGenerated}
+            onSyncRecommendationToDrive={handleSyncRecommendationToDrive}
+            onRefreshLatestFromDrive={() => fetchLatestRecommendationFromDrive()}
+            onOpenDriveSetup={() => setIsSetupModalOpen(true)}
+            onGoToAnalysis={() => setActiveView('analysis')}
           />
         )}
       </main>

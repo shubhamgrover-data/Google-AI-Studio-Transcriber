@@ -155,7 +155,7 @@ export function DriveSetupModal({
           <div className="flex items-start gap-2.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 text-xs text-[#334155]">
             <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[#16A34A]" aria-hidden="true" />
             <p className="leading-relaxed">
-              Each transcribed video gets its own folder <span className="font-mono text-[#0F172A]">CueScript/&lt;FB|Insta|YT&gt; - &lt;Title (50 chars)&gt;/</span> containing <span className="font-mono">audio.*</span>, <span className="font-mono">transcript.json/.srt/.txt</span>, and <span className="font-mono">analysis.md</span> (when Gen AI Analysis is run). Scoped strictly to <span className="font-mono text-[#0F172A]">drive.file</span>—your other Drive files remain hidden.
+              Each transcribed video gets its own folder <span className="font-mono text-[#0F172A]">CueScript/&lt;FB|Insta|YT&gt; - &lt;Title (50 chars)&gt;/</span> containing <span className="font-mono">audio.*</span>, <span className="font-mono">transcript.json/.srt/.txt</span>, and <span className="font-mono">analysis.md</span>. Consolidated stock picks are archived inside <span className="font-mono text-[#0F172A]">CueScript/Recommendations/</span> as <span className="font-mono">Recommendations_&lt;dd/mm/yyyy HH:MM:SS&gt;.md/.json</span>. Scoped strictly to <span className="font-mono text-[#0F172A]">drive.file</span>—your other Drive files remain hidden.
             </p>
           </div>
 

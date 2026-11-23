@@ -19,7 +19,9 @@ import {
   computeSourceKey,
   downloadDriveAudioToTemp,
   formatDriveVideoFolderName,
+  formatRecommendationTimestamp,
   getBridgeConfigurationError,
+  getLatestRecommendationFromDrive,
   isDriveBridgeConfigured,
   isDriveRequestAuthorized,
   isPasscodeRequired,
@@ -30,12 +32,16 @@ import {
   mintOwnerSessionToken,
   pingDriveBridge,
   saveAudioFileToDrive,
+  saveRecommendationToDrive,
   saveTranscriptBundleToDrive,
   trashDriveEntry,
   verifyOwnerPasscode,
   type DriveJobPayload,
   type DriveLookupResult,
   type DriveTranscriptFileIds,
+  type RecommendationEntryPayload,
+  type RecommendationSnapshotPayload,
+  type RecommendationSourceFilePayload,
 } from './server/driveBridge.ts';
 
 dotenv.config();
@@ -3939,6 +3945,996 @@ Output ONLY the following 3 sections in exact Markdown table format:
           };
           record.status = 'completed';
           record.stageLabel = 'Analysis complete';
+        } catch (err) {
+          const mapped = formatGeminiError(err);
+          record.status = 'failed';
+          record.error = mapped.message;
+        }
+      })();
+    });
+  });
+
+  // ============================================================================
+  // Phase 2: Consolidated Stock Recommendations (from per-video analysis.md files)
+  // ============================================================================
+
+  const RECOMMENDATIONS_RESPONSE_SCHEMA = {
+    type: Type.OBJECT,
+    properties: {
+      executiveSummary: {
+        type: Type.STRING,
+        description:
+          '2 to 3 concise sentences summarizing the strongest overlapping picks, notable swing setups, and any cross-video cautions found across the provided analysis.md files.',
+      },
+      strongBuys: {
+        type: Type.ARRAY,
+        description:
+          'Consolidated list of high-conviction Strong Buy / long-term accumulation / core portfolio stocks (one entry per stock across all files).',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            stock: { type: Type.STRING, description: 'Official normalized company name.' },
+            atfNumber: {
+              type: Type.STRING,
+              nullable: true,
+              description: 'ATF Top 60 serial number such as "#12", or null if outside ATF Top 60.',
+            },
+            entryAndDipLevels: {
+              type: Type.STRING,
+              description:
+                'Exact entry zones, CMP/buy levels, or dip prices mentioned across sources, or "No price level given".',
+            },
+            targetsAndStopLoss: {
+              type: Type.STRING,
+              description:
+                'Exact upside targets, multi-bagger expectations, exit levels, or stop-loss mentioned across sources, or "No target given". If different videos give different targets, report all with source IDs.',
+            },
+            horizonAndGuidance: {
+              type: Type.STRING,
+              description:
+                'Holding horizon, buying cadence (e.g., Friday SIP, accumulate on dips), and concise conviction notes grounded strictly in the files.',
+            },
+            hasLevelConflict: {
+              type: Type.BOOLEAN,
+              description:
+                'True only if multiple source files state differing or conflicting entry levels, targets, or stances for this stock.',
+            },
+            sources: {
+              type: Type.ARRAY,
+              description: 'Compact source IDs and timestamps where this stock and its levels came from.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  sourceId: {
+                    type: Type.STRING,
+                    description: 'Exact short source ID from the header (e.g., "S1", "S2", "S3").',
+                  },
+                  timestamps: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'Exact MM:SS timestamps extracted from that analysis.md file.',
+                  },
+                  specificNotes: {
+                    type: Type.STRING,
+                    description: 'Short note showing which specific level or call came from this video.',
+                  },
+                },
+                required: ['sourceId', 'timestamps'],
+              },
+            },
+          },
+          required: [
+            'stock',
+            'entryAndDipLevels',
+            'targetsAndStopLoss',
+            'horizonAndGuidance',
+            'hasLevelConflict',
+            'sources',
+          ],
+        },
+      },
+      swingTrades: {
+        type: Type.ARRAY,
+        description:
+          'Consolidated list of short-to-medium-term Swing Trades / tactical positional setups (one entry per stock across all files).',
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            stock: { type: Type.STRING, description: 'Official normalized company name.' },
+            atfNumber: {
+              type: Type.STRING,
+              nullable: true,
+              description: 'ATF Top 60 serial number such as "#12", or null if outside ATF Top 60.',
+            },
+            entryAndDipLevels: {
+              type: Type.STRING,
+              description:
+                'Exact entry zones, breakout/dip buy levels mentioned across sources, or "No price level given".',
+            },
+            targetsAndStopLoss: {
+              type: Type.STRING,
+              description:
+                'Exact swing exit targets, percentage upside, or stop-loss mentioned across sources, or "No target given".',
+            },
+            horizonAndGuidance: {
+              type: Type.STRING,
+              description:
+                'Swing timeframe (e.g., 1-3 months, short-term tactical bounce), profit-booking rules, and key notes.',
+            },
+            hasLevelConflict: {
+              type: Type.BOOLEAN,
+              description:
+                'True only if multiple source files state differing or conflicting swing targets or levels.',
+            },
+            sources: {
+              type: Type.ARRAY,
+              description: 'Compact source IDs and timestamps where this swing trade and its levels came from.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  sourceId: {
+                    type: Type.STRING,
+                    description: 'Exact short source ID from the header (e.g., "S1", "S2", "S3").',
+                  },
+                  timestamps: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'Exact MM:SS timestamps extracted from that analysis.md file.',
+                  },
+                  specificNotes: {
+                    type: Type.STRING,
+                    description: 'Short note showing which specific swing level or target came from this video.',
+                  },
+                },
+                required: ['sourceId', 'timestamps'],
+              },
+            },
+          },
+          required: [
+            'stock',
+            'entryAndDipLevels',
+            'targetsAndStopLoss',
+            'horizonAndGuidance',
+            'hasLevelConflict',
+            'sources',
+          ],
+        },
+      },
+    },
+    required: ['executiveSummary', 'strongBuys', 'swingTrades'],
+  };
+
+  const RECOMMENDATIONS_PROMPT = `You are a senior equity research consolidator. I am providing multiple per-video analysis.md files, each tagged with a short Source ID (S1, S2, S3, ...).
+
+Your task is to synthesize ALL provided analysis.md files into two strictly structured, consolidated recommendation lists:
+1. "strongBuys": High-conviction core/long-term Strong Buy calls (e.g., strong accumulation, Friday SIP / 26-month plan, multi-bagger / 2x-3x calls, emphatic "steal" or core ATF Top 60 / outside ATF strong buys).
+2. "swingTrades": Tactical short-to-medium-term Swing Trades, positional trades, explicit "swing trade" / 1-6 month / bounce / profit-booking setups.
+
+### Strict Consolidation Rules
+1. Consolidate Per Stock:
+   - If the same stock appears in multiple analysis.md files within the same category, merge it into ONE consolidated entry (normalize minor spelling/case differences to the official company name).
+   - If a stock is explicitly recommended as BOTH a long-term Strong Buy AND a separate Swing Trade setup across the files, include it in both arrays with the respective levels/notes clearly scoped to each category.
+2. Exclude Non-Buys:
+   - Do NOT include stocks whose stance across the files is strictly "avoid", "sell", "too expensive / wait", or "hold only".
+   - If one video recommends a stock as a Strong Buy while another video warns "wait / expensive / book profit", keep the stock if strongly recommended, set "hasLevelConflict": true, and explicitly cite the caution under that source ID.
+3. Preserve Exact Levels & Never Fabricate:
+   - Extract exact entry prices, dip zones, targets, upside multiples, stop-losses, holding horizons, and buying cadences directly from the attached files.
+   - If no entry/dip level was stated, write "No price level given". If no target/stop-loss was stated, write "No target given".
+   - If different videos give different price targets or entry levels for the same stock, include ALL of them and set "hasLevelConflict": true.
+   - NEVER add external live market prices, ticker guesses, or personal financial advice.
+4. Compact Source Attribution (IMPORTANT):
+   - Reference each source ONLY by its short "sourceId" ("S1", "S2", "S3", etc.) — do NOT repeat long video titles or filenames in JSON. The server expands each sourceId automatically.
+   - Include exact "timestamps" (e.g., ["04:06", "43:57"]) and concise "specificNotes" attributing which levels/calls came from that source.
+5. ATF Number Preservation:
+   - Preserve the exact ATF Top 60 serial number (e.g., "#12") if present in any source file; otherwise set "atfNumber": null.
+6. Output Format:
+   - Return ONLY valid JSON (no markdown fences, no commentary outside JSON) matching this exact shape:
+{
+  "executiveSummary": "2-3 concise sentences summarizing overlapping high-conviction picks, notable swing setups, and cross-video conflicts.",
+  "strongBuys": [
+    {
+      "stock": "Company Name",
+      "atfNumber": "#12 or null",
+      "entryAndDipLevels": "Exact entry/dip prices or No price level given",
+      "targetsAndStopLoss": "Exact targets/exit/SL or No target given",
+      "horizonAndGuidance": "Concise horizon, buying cadence, key conviction notes",
+      "hasLevelConflict": false,
+      "sources": [
+        {
+          "sourceId": "S1",
+          "timestamps": ["04:06"],
+          "specificNotes": "Exact levels or call from S1"
+        }
+      ]
+    }
+  ],
+  "swingTrades": [
+    {
+      "stock": "Company Name",
+      "atfNumber": "#12 or null",
+      "entryAndDipLevels": "Exact entry/dip prices or No price level given",
+      "targetsAndStopLoss": "Exact swing target/SL or No target given",
+      "horizonAndGuidance": "Concise swing horizon and tactical setup notes",
+      "hasLevelConflict": false,
+      "sources": [
+        {
+          "sourceId": "S2",
+          "timestamps": ["12:40"],
+          "specificNotes": "Exact swing levels from S2"
+        }
+      ]
+    }
+  ]
+}`;
+
+  interface AttachedAnalysisFile {
+    sourceId: string;
+    fileName: string;
+    videoTitle: string;
+    folderName?: string;
+    jobId?: string;
+    sourceKey?: string;
+    markdown: string;
+    condensedMarkdown: string;
+    buffer: Buffer;
+  }
+
+  interface RawRecommendationSourceItem {
+    sourceId?: string;
+    videoTitle?: string;
+    sourceFileName?: string;
+    timestamps?: string[];
+    specificNotes?: string;
+  }
+
+  interface RawRecommendationEntry {
+    stock?: string;
+    atfNumber?: string | number | null;
+    entryAndDipLevels?: string;
+    targetsAndStopLoss?: string;
+    horizonAndGuidance?: string;
+    hasLevelConflict?: boolean;
+    sources?: RawRecommendationSourceItem[];
+  }
+
+  interface RawRecommendationJson {
+    executiveSummary?: string;
+    strongBuys?: RawRecommendationEntry[];
+    swingTrades?: RawRecommendationEntry[];
+  }
+
+  function sanitizeRecommendationVideoTitle(
+    folderName: string | undefined,
+    rawTitle: string | undefined,
+    fallbackFileName: string
+  ): string {
+    const preferred = (folderName || '').replace(/\s+/g, ' ').trim();
+    if (preferred) {
+      return preferred.length > 72 ? `${preferred.slice(0, 72).trimEnd()}…` : preferred;
+    }
+    const cleaned = (rawTitle || fallbackFileName.replace(/\.md$/i, ''))
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleaned) return 'Analyzed Video';
+    return cleaned.length > 64 ? `${cleaned.slice(0, 64).trimEnd()}…` : cleaned;
+  }
+
+  function stripNotDiscussedSection(markdown: string): string {
+    const normalized = markdown.replace(/\r\n/g, '\n').trim();
+    // Strip "### 3. Stocks in ATF Top 60 — NOT Discussed..." table to eliminate irrelevant token noise
+    const match = normalized.match(/\n#{2,4}\s*3\.\s*[^\n]*not\s+discussed[\s\S]*$/i);
+    if (match && typeof match.index === 'number' && match.index > 100) {
+      return normalized.slice(0, match.index).trim();
+    }
+    return normalized;
+  }
+
+  function parseLooseJsonObject<T>(rawText: string): T {
+    const stripped = stripReasoningTags(rawText);
+    const fencedMatch = stripped.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = (fencedMatch?.[1] || stripped).trim();
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      const firstBrace = candidate.indexOf('{');
+      const lastBrace = candidate.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        return JSON.parse(candidate.slice(firstBrace, lastBrace + 1)) as T;
+      }
+      throw new Error('Model did not return valid JSON for stock recommendations.');
+    }
+  }
+
+  function normalizeAtfNumber(raw: string | number | null | undefined): string | null {
+    if (raw === null || raw === undefined) return null;
+    const str = String(raw).trim();
+    if (!str || /^(null|none|n\/a|outside|—|-)$/i.test(str)) return null;
+    if (/^\d+$/.test(str)) return `#${str}`;
+    return str;
+  }
+
+  function resolveAttachedSource(
+    raw: RawRecommendationSourceItem,
+    attachedFiles: AttachedAnalysisFile[]
+  ): AttachedAnalysisFile | undefined {
+    const rawId = typeof raw?.sourceId === 'string' ? raw.sourceId.trim().toUpperCase() : '';
+    if (rawId) {
+      const byExactId = attachedFiles.find((f) => f.sourceId === rawId);
+      if (byExactId) return byExactId;
+      const numMatch = rawId.match(/(\d+)/);
+      if (numMatch) {
+        const idx = Number(numMatch[1]) - 1;
+        if (idx >= 0 && idx < attachedFiles.length) return attachedFiles[idx];
+      }
+    }
+    const rawFile = typeof raw?.sourceFileName === 'string' ? raw.sourceFileName.trim().toLowerCase() : '';
+    if (rawFile) {
+      const byFile = attachedFiles.find((f) => f.fileName.toLowerCase() === rawFile);
+      if (byFile) return byFile;
+    }
+    const rawTitle = typeof raw?.videoTitle === 'string' ? raw.videoTitle.trim().toLowerCase() : '';
+    if (rawTitle) {
+      const byTitle = attachedFiles.find(
+        (f) =>
+          f.videoTitle.toLowerCase() === rawTitle ||
+          (f.folderName && f.folderName.toLowerCase() === rawTitle)
+      );
+      if (byTitle) return byTitle;
+    }
+    return undefined;
+  }
+
+  function normalizeRecommendationEntries(
+    items: RawRecommendationEntry[] | undefined,
+    category: 'strong_buy' | 'swing_trade',
+    attachedFiles: AttachedAnalysisFile[]
+  ): RecommendationEntryPayload[] {
+    if (!Array.isArray(items)) return [];
+    const fallbackSource = attachedFiles[0];
+    const result: RecommendationEntryPayload[] = [];
+
+    for (const item of items) {
+      const stock = typeof item?.stock === 'string' ? item.stock.trim() : '';
+      if (!stock) continue;
+
+      const normalizedSources = Array.isArray(item.sources)
+        ? item.sources
+            .map((s) => {
+              const matched = resolveAttachedSource(s, attachedFiles);
+              const resolvedTitle =
+                matched?.videoTitle ||
+                (typeof s?.videoTitle === 'string' && s.videoTitle.trim()
+                  ? sanitizeRecommendationVideoTitle(undefined, s.videoTitle, 'analysis.md')
+                  : fallbackSource?.videoTitle || 'Analyzed Video');
+              const resolvedFileName =
+                matched?.fileName ||
+                (typeof s?.sourceFileName === 'string' && s.sourceFileName.trim()) ||
+                fallbackSource?.fileName ||
+                'analysis.md';
+
+              return {
+                videoTitle: resolvedTitle,
+                sourceFileName: resolvedFileName,
+                timestamps: Array.isArray(s?.timestamps)
+                  ? s.timestamps
+                      .map((t) => String(t || '').trim())
+                      .filter((t) => Boolean(t) && !/^(none|n\/a|-)$/i.test(t))
+                  : [],
+                specificNotes:
+                  typeof s?.specificNotes === 'string' && s.specificNotes.trim()
+                    ? s.specificNotes.trim()
+                    : undefined,
+              };
+            })
+            .filter((s) => Boolean(s.videoTitle))
+        : [];
+
+      result.push({
+        stock,
+        atfNumber: normalizeAtfNumber(item.atfNumber),
+        category,
+        entryAndDipLevels:
+          (typeof item.entryAndDipLevels === 'string' && item.entryAndDipLevels.trim()) ||
+          'No price level given',
+        targetsAndStopLoss:
+          (typeof item.targetsAndStopLoss === 'string' && item.targetsAndStopLoss.trim()) ||
+          'No target given',
+        horizonAndGuidance:
+          (typeof item.horizonAndGuidance === 'string' && item.horizonAndGuidance.trim()) ||
+          'See source analysis notes.',
+        hasLevelConflict: Boolean(item.hasLevelConflict),
+        sources:
+          normalizedSources.length > 0
+            ? normalizedSources
+            : [
+                {
+                  videoTitle: fallbackSource?.videoTitle || 'Analyzed Video',
+                  sourceFileName: fallbackSource?.fileName || 'analysis.md',
+                  timestamps: [],
+                },
+              ],
+      });
+    }
+
+    // Sort by multiple sources first, then ATF # ascending, then stock name alphabetically
+    return result.sort((a, b) => {
+      if (b.sources.length !== a.sources.length) {
+        return b.sources.length - a.sources.length;
+      }
+      if (a.atfNumber && !b.atfNumber) return -1;
+      if (!a.atfNumber && b.atfNumber) return 1;
+      return a.stock.localeCompare(b.stock);
+    });
+  }
+
+  function escapeMarkdownCell(text: string): string {
+    return String(text || '')
+      .replace(/\|/g, '\\|')
+      .replace(/\r?\n+/g, ' ')
+      .trim();
+  }
+
+  function renderEntriesMarkdownTable(entries: RecommendationEntryPayload[]): string {
+    if (entries.length === 0) {
+      return '_No stocks matched this category across the selected analysis.md files._';
+    }
+    const header =
+      '| ATF # | Stock | Entry / Dip Levels | Targets & Stop-Loss | Horizon & Buying Plan | Sources & Timestamps |\n' +
+      '| :--- | :--- | :--- | :--- | :--- | :--- |';
+    const rows = entries.map((entry) => {
+      const stockCell = entry.hasLevelConflict
+        ? `**${escapeMarkdownCell(entry.stock)}** _(Multiple targets)_`
+        : `**${escapeMarkdownCell(entry.stock)}**`;
+      const sourcesCell = entry.sources
+        .map((src) => {
+          const ts = src.timestamps.length > 0 ? ` (${src.timestamps.join(', ')})` : '';
+          const note = src.specificNotes ? `: ${src.specificNotes}` : '';
+          return `${src.videoTitle}${ts}${note}`;
+        })
+        .join('; ');
+      return `| ${escapeMarkdownCell(entry.atfNumber || 'Outside ATF')} | ${stockCell} | ${escapeMarkdownCell(entry.entryAndDipLevels)} | ${escapeMarkdownCell(entry.targetsAndStopLoss)} | ${escapeMarkdownCell(entry.horizonAndGuidance)} | ${escapeMarkdownCell(sourcesCell)} |`;
+    });
+    return `${header}\n${rows.join('\n')}`;
+  }
+
+  function renderRecommendationsMarkdown(params: {
+    formattedTimestamp: string;
+    engineUsed: string;
+    sourceVideos: RecommendationSourceFilePayload[];
+    executiveSummary: string;
+    strongBuys: RecommendationEntryPayload[];
+    swingTrades: RecommendationEntryPayload[];
+  }): string {
+    const sourcesList = params.sourceVideos
+      .map(
+        (s, idx) =>
+          `${idx + 1}. **${s.title}** (\`${s.folderName ? `${s.folderName}/analysis.md` : s.fileName}\`)`
+      )
+      .join('\n');
+
+    return [
+      `# Consolidated Stock Recommendations (${params.formattedTimestamp})`,
+      '',
+      `- **Generated At:** ${params.formattedTimestamp}`,
+      `- **AI Engine:** ${params.engineUsed}`,
+      `- **Analyzed Source Files:** ${params.sourceVideos.length}`,
+      '',
+      '## Executive Summary',
+      '',
+      params.executiveSummary || 'Consolidated stock recommendations from selected analysis.md files.',
+      '',
+      `## 1. Strong Buys (${params.strongBuys.length})`,
+      '',
+      renderEntriesMarkdownTable(params.strongBuys),
+      '',
+      `## 2. Swing Trades (${params.swingTrades.length})`,
+      '',
+      renderEntriesMarkdownTable(params.swingTrades),
+      '',
+      '## Source analysis.md Files Included',
+      '',
+      sourcesList || '_None listed_',
+      '',
+    ].join('\n');
+  }
+
+  async function runRecommendationsWithOpenAiCompatPrimary(
+    files: AttachedAnalysisFile[],
+    onFirstToken?: () => void
+  ): Promise<RawRecommendationJson> {
+    const filesBundleText = files
+      .map(
+        (f) =>
+          `===== SOURCE ${f.sourceId} (${f.videoTitle}) =====\n` +
+          `${f.condensedMarkdown}\n` +
+          `===== END ${f.sourceId} =====`
+      )
+      .join('\n\n');
+
+    const endpoint = `${OPENAI_COMPAT_ANALYSIS_BASE_URL}/chat/completions`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream, application/json',
+      },
+      body: JSON.stringify({
+        model: OPENAI_COMPAT_ANALYSIS_MODEL,
+        stream: true,
+        messages: [
+          {
+            role: 'user',
+            content: `${RECOMMENDATIONS_PROMPT}\n\n---\n\n### SOURCE ANALYSIS.MD FILES (${files.length} TOTAL):\n\n${filesBundleText}`,
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(300_000),
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      const compactErr = errBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+      throw new Error(`HTTP ${response.status} ${response.statusText}${compactErr ? `: ${compactErr}` : ''}`);
+    }
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    let textContent = '';
+
+    if (contentType.includes('text/event-stream') && response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let lineBuffer = '';
+      let notifiedFirstToken = false;
+
+      const processSseLine = (rawLine: string) => {
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) return;
+        const dataStr = line.slice(5).trim();
+        if (!dataStr || dataStr === '[DONE]') return;
+        try {
+          const chunk = JSON.parse(dataStr) as {
+            choices?: Array<{
+              delta?: { content?: string | Array<{ text?: string }> | null };
+              message?: { content?: string | Array<{ text?: string }> | null };
+            }>;
+          };
+          const piece = chunk.choices?.[0]?.delta?.content ?? chunk.choices?.[0]?.message?.content;
+          if (typeof piece === 'string' && piece.length > 0) {
+            textContent += piece;
+            if (!notifiedFirstToken) {
+              notifiedFirstToken = true;
+              onFirstToken?.();
+            }
+          } else if (Array.isArray(piece)) {
+            const joined = piece.map((p) => p?.text || '').join('');
+            if (joined.length > 0) {
+              textContent += joined;
+              if (!notifiedFirstToken) {
+                notifiedFirstToken = true;
+                onFirstToken?.();
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed keepalive or partial metadata SSE frames
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        lineBuffer += decoder.decode(value, { stream: true });
+        const lines = lineBuffer.split(/\r?\n/);
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          processSseLine(line);
+        }
+      }
+      lineBuffer += decoder.decode();
+      if (lineBuffer.trim()) {
+        for (const line of lineBuffer.split(/\r?\n/)) {
+          processSseLine(line);
+        }
+      }
+    } else {
+      const rawBody = await response.text();
+      // Handle proxies that send SSE text without setting text/event-stream header
+      if (rawBody.trimStart().startsWith('data:')) {
+        for (const rawLine of rawBody.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') continue;
+          try {
+            const chunk = JSON.parse(dataStr) as {
+              choices?: Array<{ delta?: { content?: string | null } }>;
+            };
+            const piece = chunk.choices?.[0]?.delta?.content;
+            if (typeof piece === 'string') textContent += piece;
+          } catch {
+            // Skip non-JSON SSE line
+          }
+        }
+      } else {
+        let parsed: {
+          choices?: Array<{ message?: { content?: string | Array<{ text?: string }> | null } }>;
+        };
+        try {
+          parsed = JSON.parse(rawBody);
+        } catch {
+          throw new Error('OpenAI-compatible endpoint returned non-JSON response.');
+        }
+        const msgContent = parsed.choices?.[0]?.message?.content;
+        textContent =
+          typeof msgContent === 'string'
+            ? msgContent
+            : Array.isArray(msgContent)
+              ? msgContent.map((part) => part?.text || '').join('\n')
+              : '';
+      }
+    }
+
+    if (!textContent.trim()) {
+      throw new Error('OpenAI-compatible endpoint returned an empty recommendations response.');
+    }
+    return parseLooseJsonObject<RawRecommendationJson>(textContent);
+  }
+
+  async function runRecommendationsWithGeminiFallback(
+    ai: GoogleGenAI,
+    files: AttachedAnalysisFile[]
+  ): Promise<RawRecommendationJson> {
+    const workDir = path.join(os.tmpdir(), `cuescript_rec_${crypto.randomBytes(6).toString('hex')}`);
+    await fs.mkdir(workDir, { recursive: true });
+    const uploadedNames: string[] = [];
+
+    try {
+      const fileParts: Array<{ fileData: { fileUri: string; mimeType: string } }> = [];
+      const manifestLines: string[] = [];
+
+      for (let i = 0; i < files.length; i += 1) {
+        const f = files[i];
+        const tempFilePath = path.join(workDir, `${f.sourceId}.txt`);
+        const framedContent =
+          `Source ID: ${f.sourceId}\n` +
+          `Source Video Title: ${f.videoTitle}\n` +
+          `\n${f.condensedMarkdown}\n`;
+        await fs.writeFile(tempFilePath, framedContent, 'utf-8');
+
+        const uploaded = await ai.files.upload({
+          file: tempFilePath,
+          config: { mimeType: 'text/plain', displayName: `${f.sourceId}-${f.fileName}` },
+        });
+        if (uploaded.name) uploadedNames.push(uploaded.name);
+        if (!uploaded.uri) {
+          throw new Error(`Gemini Files API upload failed for ${f.fileName}.`);
+        }
+
+        fileParts.push({
+          fileData: {
+            fileUri: uploaded.uri,
+            mimeType: uploaded.mimeType || 'text/plain',
+          },
+        });
+        manifestLines.push(`${f.sourceId}: "${f.videoTitle}"`);
+      }
+
+      const promptWithManifest = [
+        RECOMMENDATIONS_PROMPT,
+        `Attached source files (${files.length}):\n${manifestLines.join('\n')}`,
+      ].join('\n\n');
+
+      const parts = [...fileParts, { text: promptWithManifest }];
+      const attempts = [
+        { model: GEMINI_MODEL, delayMs: 0 },
+        { model: GEMINI_FALLBACK_MODEL, delayMs: 1200 },
+        { model: GEMINI_FALLBACK_MODEL, delayMs: 5000 },
+      ];
+
+      let lastErr: unknown;
+      for (const attempt of attempts) {
+        if (attempt.delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
+        }
+        try {
+          const response = await ai.models.generateContent({
+            model: attempt.model,
+            contents: [{ role: 'user', parts }],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: RECOMMENDATIONS_RESPONSE_SCHEMA,
+            },
+          });
+          const text = (response.text || '').trim();
+          if (!text) {
+            throw new Error('Gemini recommendations returned an empty response.');
+          }
+          return parseLooseJsonObject<RawRecommendationJson>(text);
+        } catch (err) {
+          lastErr = err;
+          if (!isTransientGeminiError(err)) {
+            throw err;
+          }
+        }
+      }
+      throw lastErr;
+    } finally {
+      for (const name of uploadedNames) {
+        await ai.files.delete({ name }).catch(() => {});
+      }
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  interface RecommendationJobRecord {
+    recommendationJobId: string;
+    status: 'processing' | 'completed' | 'failed';
+    stageLabel: string;
+    createdAt: number;
+    recommendation?: RecommendationSnapshotPayload;
+    error?: string;
+  }
+
+  const recommendationJobs = new Map<string, RecommendationJobRecord>();
+  const recommendationsUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024, files: 50 },
+  });
+
+  app.get('/api/recommendations/latest', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.json({ ok: true, hasRecommendation: false });
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Unlock Drive Bridge first.' });
+      return;
+    }
+    const result = await getLatestRecommendationFromDrive();
+    if (!result.ok) {
+      res.json({
+        ok: true,
+        hasRecommendation: false,
+        needsBridgeUpdate: Boolean(result.needsBridgeUpdate),
+        warning: result.error,
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      hasRecommendation: result.hasRecommendation,
+      recommendation: result.recommendation,
+    });
+  });
+
+  app.post('/api/recommendations/sync', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.status(400).json({ ok: false, message: 'Google Drive Bridge is not configured.' });
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Unlock Drive Bridge before syncing.' });
+      return;
+    }
+    const snapshot = req.body?.recommendation as RecommendationSnapshotPayload | undefined;
+    if (!snapshot || typeof snapshot.markdown !== 'string' || !snapshot.formattedTimestamp) {
+      res.status(400).json({ ok: false, message: 'Missing valid recommendation snapshot payload.' });
+      return;
+    }
+    const saved = await saveRecommendationToDrive(snapshot);
+    if (!saved.ok) {
+      res.status(saved.needsBridgeUpdate ? 422 : 502).json({
+        ok: false,
+        needsBridgeUpdate: Boolean(saved.needsBridgeUpdate),
+        message: saved.error || 'Failed to save recommendation to Google Drive.',
+      });
+      return;
+    }
+    res.json({
+      ok: true,
+      driveFiles: saved.driveFiles,
+      syncedAt: saved.syncedAt,
+    });
+  });
+
+  app.get('/api/recommendations/jobs/:jobId', (req: Request, res: Response) => {
+    const jobId = req.params.jobId || '';
+    if (!/^rec_[a-f0-9]+$/i.test(jobId)) {
+      res.status(400).json({ ok: false, message: 'Invalid recommendation job identifier.' });
+      return;
+    }
+    const rec = recommendationJobs.get(jobId);
+    if (!rec) {
+      res.status(404).json({ ok: false, message: 'Recommendation job not found or expired.' });
+      return;
+    }
+    res.json({
+      ok: true,
+      recommendationJobId: rec.recommendationJobId,
+      status: rec.status,
+      stageLabel: rec.stageLabel,
+      recommendation: rec.recommendation,
+      error: rec.error,
+    });
+  });
+
+  app.post('/api/recommendations/generate', (req: Request, res: Response) => {
+    recommendationsUpload.array('analysisFiles', 50)(req, res, (multerErr: unknown) => {
+      if (multerErr) {
+        res.status(400).json({
+          ok: false,
+          message: 'Could not read uploaded analysis.md files.',
+        });
+        return;
+      }
+
+      const uploadedFiles = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+      if (uploadedFiles.length === 0) {
+        res.status(400).json({
+          ok: false,
+          message: 'Select at least one analyzed video with an analysis.md file before generating recommendations.',
+        });
+        return;
+      }
+
+      let manifestItems: Array<{
+        jobId?: string;
+        sourceKey?: string;
+        title?: string;
+        folderName?: string;
+        fileName?: string;
+      }> = [];
+      if (typeof req.body?.manifest === 'string' && req.body.manifest.trim()) {
+        try {
+          const parsedManifest = JSON.parse(req.body.manifest);
+          if (Array.isArray(parsedManifest)) {
+            manifestItems = parsedManifest;
+          }
+        } catch {
+          manifestItems = [];
+        }
+      }
+
+      const attachedFiles: AttachedAnalysisFile[] = [];
+      for (let i = 0; i < uploadedFiles.length; i += 1) {
+        const file = uploadedFiles[i];
+        const markdown = file.buffer.toString('utf-8').trim();
+        if (!markdown) continue;
+        const meta = manifestItems[i] || {};
+        const fileName = (meta.fileName || file.originalname || `analysis_${i + 1}.md`).trim();
+        const videoTitle = sanitizeRecommendationVideoTitle(meta.folderName, meta.title, fileName);
+        const condensedMarkdown = stripNotDiscussedSection(markdown);
+        attachedFiles.push({
+          sourceId: `S${attachedFiles.length + 1}`,
+          fileName,
+          videoTitle,
+          folderName: meta.folderName,
+          jobId: meta.jobId,
+          sourceKey: meta.sourceKey,
+          markdown,
+          condensedMarkdown,
+          buffer: file.buffer,
+        });
+      }
+
+      if (attachedFiles.length === 0) {
+        res.status(400).json({
+          ok: false,
+          message: 'All selected analysis.md files were empty.',
+        });
+        return;
+      }
+
+      const rawClientTs =
+        typeof req.body?.clientTimestamp === 'string' ? req.body.clientTimestamp.trim() : '';
+      const formattedTimestamp = /^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/.test(rawClientTs)
+        ? rawClientTs
+        : formatRecommendationTimestamp(new Date());
+      const fileBaseName = `Recommendations_${formattedTimestamp}`;
+      const driveEnabled = isDriveBridgeConfigured() && isDriveRequestAuthorized(req);
+
+      const now = Date.now();
+      for (const [id, item] of recommendationJobs.entries()) {
+        if (now - item.createdAt > 30 * 60 * 1000) recommendationJobs.delete(id);
+      }
+
+      const recommendationJobId = `rec_${crypto.randomBytes(8).toString('hex')}`;
+      const record: RecommendationJobRecord = {
+        recommendationJobId,
+        status: 'processing',
+        stageLabel: `Synthesizing ${attachedFiles.length} analysis.md ${attachedFiles.length === 1 ? 'file' : 'files'} with OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})...`,
+        createdAt: now,
+      };
+      recommendationJobs.set(recommendationJobId, record);
+
+      res.status(202).json({
+        ok: true,
+        recommendationJobId,
+        status: 'processing',
+      });
+
+      void (async () => {
+        try {
+          let rawOutput: RawRecommendationJson;
+          let engineUsed = `OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})`;
+
+          try {
+            record.stageLabel = `Synthesizing ${attachedFiles.length} analysis.md ${attachedFiles.length === 1 ? 'file' : 'files'} with OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})...`;
+            rawOutput = await runRecommendationsWithOpenAiCompatPrimary(attachedFiles, () => {
+              record.stageLabel = `Streaming recommendations from OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})...`;
+            });
+          } catch (primaryErr) {
+            const safeReason =
+              primaryErr instanceof Error ? primaryErr.message.slice(0, 140) : 'primary endpoint failed';
+            console.warn(
+              `OpenAI Recommendations failed (${safeReason}); falling back to Google Gemini Files API.`
+            );
+            record.stageLabel = `Primary API unavailable — uploading ${attachedFiles.length} files to Google Gemini...`;
+            const ai = getGeminiClient();
+            rawOutput = await runRecommendationsWithGeminiFallback(ai, attachedFiles);
+            engineUsed = 'Google Gemini fallback';
+          }
+
+          const sourceVideos: RecommendationSourceFilePayload[] = attachedFiles.map((f) => ({
+            jobId: f.jobId,
+            sourceKey: f.sourceKey,
+            title: f.videoTitle,
+            folderName: f.folderName,
+            fileName: f.fileName,
+          }));
+
+          const strongBuys = normalizeRecommendationEntries(
+            rawOutput.strongBuys,
+            'strong_buy',
+            attachedFiles
+          );
+          const swingTrades = normalizeRecommendationEntries(
+            rawOutput.swingTrades,
+            'swing_trade',
+            attachedFiles
+          );
+          const executiveSummary =
+            (typeof rawOutput.executiveSummary === 'string' && rawOutput.executiveSummary.trim()) ||
+            `Synthesized ${strongBuys.length} Strong Buy and ${swingTrades.length} Swing Trade recommendations from ${attachedFiles.length} analyzed videos.`;
+
+          const markdown = renderRecommendationsMarkdown({
+            formattedTimestamp,
+            engineUsed,
+            sourceVideos,
+            executiveSummary,
+            strongBuys,
+            swingTrades,
+          });
+
+          const snapshot: RecommendationSnapshotPayload = {
+            id: recommendationJobId,
+            generatedAt: new Date().toISOString(),
+            formattedTimestamp,
+            fileBaseName,
+            engineUsed,
+            sourceVideos,
+            executiveSummary,
+            strongBuys,
+            swingTrades,
+            markdown,
+            syncedToDrive: false,
+          };
+
+          if (driveEnabled) {
+            record.stageLabel = `Saving ${fileBaseName}.md & .json to Google Drive...`;
+            const driveResult = await saveRecommendationToDrive(snapshot);
+            if (driveResult.ok) {
+              snapshot.syncedToDrive = true;
+              snapshot.driveFiles = driveResult.driveFiles;
+            } else {
+              snapshot.syncedToDrive = false;
+              snapshot.driveSyncWarning = driveResult.error;
+            }
+          }
+
+          record.recommendation = snapshot;
+          record.status = 'completed';
+          record.stageLabel = 'Recommendations ready';
         } catch (err) {
           const mapped = formatGeminiError(err);
           record.status = 'failed';

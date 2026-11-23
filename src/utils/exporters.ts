@@ -1,4 +1,4 @@
-import type { TranscriptJob } from '../types/transcript';
+import type { RecommendationSnapshot, TranscriptJob } from '../types/transcript';
 
 /** Formats seconds into MM:SS or HH:MM:SS for UI display */
 export function formatDisplayTimestamp(totalSeconds: number): string {
@@ -214,4 +214,82 @@ export function detectPlatformFromInput(rawUrl: string): {
   } catch {
     return { platform: null, label: '' };
   }
+}
+
+/** Formats local wall-clock time strictly as dd/mm/yyyy HH:MM:SS */
+export function formatLocalRecommendationTimestamp(date: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const dd = pad(date.getDate());
+  const mm = pad(date.getMonth() + 1);
+  const yyyy = String(date.getFullYear());
+  const hh = pad(date.getHours());
+  const min = pad(date.getMinutes());
+  const ss = pad(date.getSeconds());
+  return `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+}
+
+/** Sanitizes Recommendations_dd/mm/yyyy HH:MM:SS for local OS file downloads */
+export function sanitizeRecommendationDownloadName(
+  fileBaseName: string,
+  ext: 'md' | 'csv' | 'json'
+): string {
+  const safeBase = (fileBaseName || 'Recommendations')
+    .replace(/\//g, '-')
+    .replace(/:/g, '-')
+    .replace(/\s+/g, '_')
+    .replace(/[^a-zA-Z0-9._-]/g, '');
+  return `${safeBase}.${ext}`;
+}
+
+function escapeCsvCell(value: string): string {
+  const str = String(value ?? '');
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+export function serializeRecommendationsToCSV(snapshot: RecommendationSnapshot): string {
+  const headers = [
+    'Category',
+    'ATF #',
+    'Stock',
+    'Entry / Dip Levels',
+    'Targets & Stop-Loss',
+    'Horizon & Buying Plan',
+    'Level Conflict',
+    'Sources & Timestamps',
+  ];
+
+  const rows: string[][] = [];
+  const allEntries = [
+    ...snapshot.strongBuys.map((e) => ({ ...e, label: 'Strong Buy' })),
+    ...snapshot.swingTrades.map((e) => ({ ...e, label: 'Swing Trade' })),
+  ];
+
+  for (const entry of allEntries) {
+    const sourcesText = entry.sources
+      .map((s) => {
+        const ts = s.timestamps.length > 0 ? ` [${s.timestamps.join(', ')}]` : '';
+        const note = s.specificNotes ? ` — ${s.specificNotes}` : '';
+        return `${s.videoTitle}${ts}${note}`;
+      })
+      .join(' | ');
+
+    rows.push([
+      entry.label,
+      entry.atfNumber || 'Outside ATF',
+      entry.stock,
+      entry.entryAndDipLevels,
+      entry.targetsAndStopLoss,
+      entry.horizonAndGuidance,
+      entry.hasLevelConflict ? 'Yes' : 'No',
+      sourcesText,
+    ]);
+  }
+
+  return [
+    headers.map(escapeCsvCell).join(','),
+    ...rows.map((r) => r.map(escapeCsvCell).join(',')),
+  ].join('\n');
 }
