@@ -6,12 +6,16 @@ import {
   Download,
   Edit3,
   ExternalLink,
+  HardDrive,
+  Loader2,
   Play,
+  RefreshCw,
   Search,
   Trash2,
   X,
 } from 'lucide-react';
-import type { TranscriptJob } from '../types/transcript';
+import type { RefreshMode, TranscriptJob } from '../types/transcript';
+import { ConfirmDeleteModal } from './ConfirmDeleteModal';
 import {
   formatDisplayTimestamp,
   getSpeakerDisplayName,
@@ -21,12 +25,21 @@ import {
   serializeToVTT,
   slugifyFilename,
   triggerFileDownload,
+  truncateTitle,
 } from '../utils/exporters';
 
 interface StudioWorkspaceProps {
   job: TranscriptJob;
   onRenameSpeaker: (speakerId: string, newName: string) => void;
-  onDeleteJob: (jobId: string) => void;
+  onDeleteJob: (jobId: string, deleteFromDrive: boolean) => Promise<void> | void;
+  onRefreshTranscript: (job: TranscriptJob, mode: RefreshMode) => void;
+  isRefreshing: boolean;
+  refreshDetail?: string;
+  refreshProgressPct?: number;
+  refreshError?: string | null;
+  onDismissRefreshError?: () => void;
+  driveEnabled: boolean;
+  driveSessionToken: string | null;
 }
 
 const PLATFORM_LABELS: Record<TranscriptJob['sourceType'], string> = {
@@ -41,6 +54,14 @@ export function StudioWorkspace({
   job,
   onRenameSpeaker,
   onDeleteJob,
+  onRefreshTranscript,
+  isRefreshing,
+  refreshDetail,
+  refreshProgressPct = 0,
+  refreshError,
+  onDismissRefreshError,
+  driveEnabled,
+  driveSessionToken,
 }: StudioWorkspaceProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSpeaker, setSelectedSpeaker] = useState<string>('ALL');
@@ -50,9 +71,14 @@ export function StudioWorkspace({
   const [speakerDraft, setSpeakerDraft] = useState('');
   const [copiedState, setCopiedState] = useState<string | null>(null);
   const [ytSeekTime, setYtSeekTime] = useState<number | null>(null);
+  const [showRefreshMenu, setShowRefreshMenu] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [authedDriveBlobUrl, setAuthedDriveBlobUrl] = useState<string | null>(null);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const mediaElRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
+  const refreshMenuRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     setSearchQuery('');
@@ -61,7 +87,53 @@ export function StudioWorkspace({
     setActiveSegmentId(null);
     setEditingSpeakerId(null);
     setYtSeekTime(null);
+    setShowRefreshMenu(false);
   }, [job.id]);
+
+  // Close reload popover when clicking outside
+  useEffect(() => {
+    if (!showRefreshMenu) return;
+    function handleOutsideClick(e: MouseEvent) {
+      if (refreshMenuRef.current && !refreshMenuRef.current.contains(e.target as Node)) {
+        setShowRefreshMenu(false);
+      }
+    }
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [showRefreshMenu]);
+
+  // When OWNER_PASSCODE is active, fetch protected Drive audio via Bearer token into an in-memory Blob URL
+  useEffect(() => {
+    const needsAuthedFetch =
+      job.mediaKind !== 'youtube' &&
+      !job.localMediaUrl &&
+      Boolean(driveSessionToken) &&
+      Boolean(job.remoteMediaUrl?.startsWith('/api/drive/audio/'));
+
+    if (!needsAuthedFetch || !job.remoteMediaUrl || !driveSessionToken) {
+      setAuthedDriveBlobUrl(null);
+      return;
+    }
+
+    let cancelled = false;
+    let createdUrl: string | null = null;
+
+    fetch(job.remoteMediaUrl, {
+      headers: { Authorization: `Bearer ${driveSessionToken}` },
+    })
+      .then((res) => (res.ok ? res.blob() : null))
+      .then((blob) => {
+        if (!blob || cancelled) return;
+        createdUrl = URL.createObjectURL(blob);
+        setAuthedDriveBlobUrl(createdUrl);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (createdUrl) URL.revokeObjectURL(createdUrl);
+    };
+  }, [job.id, job.mediaKind, job.localMediaUrl, job.remoteMediaUrl, driveSessionToken]);
 
   useEffect(() => {
     if (job.mediaKind !== 'youtube') return;
@@ -182,114 +254,276 @@ export function StudioWorkspace({
     setEditingSpeakerId(null);
   }
 
-  const playableSrc = job.localMediaUrl || job.remoteMediaUrl;
+  const playableSrc =
+    job.localMediaUrl ||
+    authedDriveBlobUrl ||
+    (job.remoteMediaUrl?.startsWith('/api/drive/audio/') && driveSessionToken
+      ? undefined
+      : job.remoteMediaUrl);
+
+  const canRefreshFromUrl = Boolean(job.sourceUrl);
+  const canRefreshFromCachedAudio = Boolean(job.sourceUrl && job.driveAudioFileId && driveEnabled);
+  const isDriveBacked = Boolean(job.syncedToDrive && job.sourceKey && driveEnabled);
+
+  function handleTriggerDelete() {
+    if (isDriveBacked) {
+      setPendingDelete(true);
+    } else {
+      void onDeleteJob(job.id, false);
+    }
+  }
+
+  async function handleConfirmDelete(deleteFromDrive: boolean) {
+    setIsDeleting(true);
+    try {
+      await onDeleteJob(job.id, deleteFromDrive);
+      setPendingDelete(false);
+    } finally {
+      setIsDeleting(false);
+    }
+  }
 
   return (
     <section aria-label="Transcript studio workbench" className="space-y-6">
       {/* Job Title & Unboxed Metadata Strip */}
-      <div className="flex flex-col gap-4 border-b border-[#E2E8F0] pb-5 lg:flex-row lg:items-end lg:justify-between">
-        <div className="min-w-0">
-          <h2 className="text-xl font-semibold tracking-tight text-[#0F172A] sm:text-2xl">
-            {job.title}
-          </h2>
-          <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[#475569]">
-            <span className="font-medium text-[#0F172A]">{PLATFORM_LABELS[job.sourceType]}</span>
-            {job.author && (
-              <>
-                <span aria-hidden="true">·</span>
-                <span>{job.author}</span>
-              </>
-            )}
-            <span aria-hidden="true">·</span>
-            <span>{job.language}</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">
-              {formatDisplayTimestamp(job.durationSeconds)}
-            </span>
-            <span aria-hidden="true">·</span>
-            <span className="tabular-nums">
-              {speakerIds.length} {speakerIds.length === 1 ? 'speaker' : 'speakers'}
-            </span>
-            <span aria-hidden="true">·</span>
-            <span className="tabular-nums">{wordCount.toLocaleString()} words</span>
-            {job.sourceUrl && (
-              <>
-                <span aria-hidden="true">·</span>
-                <a
-                  href={job.sourceUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-[#0F172A] underline underline-offset-4 hover:text-[#E11D48]"
+      <div className="space-y-4 border-b border-[#E2E8F0] pb-5">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0">
+            <h2
+              title={job.title}
+              className="text-xl font-semibold tracking-tight text-[#0F172A] sm:text-2xl"
+            >
+              {truncateTitle(job.title, 50)}
+            </h2>
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[#475569]">
+              <span className="font-medium text-[#0F172A]">{PLATFORM_LABELS[job.sourceType]}</span>
+              {job.author && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{job.author}</span>
+                </>
+              )}
+              <span aria-hidden="true">·</span>
+              <span>{job.language}</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono tabular-nums">
+                {formatDisplayTimestamp(job.durationSeconds)}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="tabular-nums">
+                {speakerIds.length} {speakerIds.length === 1 ? 'speaker' : 'speakers'}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="tabular-nums">{wordCount.toLocaleString()} words</span>
+              {job.syncedToDrive && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span
+                    title={
+                      job.driveFolderName
+                        ? `CueScript/${job.driveFolderName}/`
+                        : 'Saved in Google Drive (CueScript/)'
+                    }
+                    className="inline-flex items-center gap-1 font-medium text-[#16A34A]"
+                  >
+                    <HardDrive className="h-3 w-3" aria-hidden="true" />
+                    {job.loadedFromCache ? 'Cached in Drive' : 'Saved to Drive'}
+                  </span>
+                </>
+              )}
+              {job.sourceUrl && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <a
+                    href={job.sourceUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-[#0F172A] underline underline-offset-4 hover:text-[#E11D48]"
+                  >
+                    Open source
+                    <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                  </a>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Export, Reload & Delete Controls */}
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => handleExport('srt')}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              SRT
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExport('vtt')}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              VTT
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExport('txt')}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              TXT
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExport('json')}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              JSON
+            </button>
+            <button
+              type="button"
+              onClick={handleCopyTranscript}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#0F172A] px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-[#1E293B] cursor-pointer"
+            >
+              {copiedState ? (
+                <>
+                  <Check className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                  {copiedState}
+                </>
+              ) : (
+                <>
+                  <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                  Copy
+                </>
+              )}
+            </button>
+
+            {/* Reload Icon Button to Refresh Cached / Existing Transcript */}
+            {canRefreshFromUrl && (
+              <div ref={refreshMenuRef} className="relative">
+                <button
+                  type="button"
+                  disabled={isRefreshing}
+                  onClick={() => setShowRefreshMenu((prev) => !prev)}
+                  aria-label="Refresh transcript"
+                  aria-expanded={showRefreshMenu}
+                  title="Refresh transcript"
+                  className={`inline-flex items-center justify-center rounded-lg border bg-white p-2 transition-colors disabled:opacity-60 cursor-pointer ${
+                    showRefreshMenu || isRefreshing
+                      ? 'border-[#0F172A] text-[#0F172A]'
+                      : 'border-[#CBD5E1] text-[#334155] hover:border-[#0F172A] hover:text-[#0F172A]'
+                  }`}
                 >
-                  Open source
-                  <ExternalLink className="h-3 w-3" aria-hidden="true" />
-                </a>
-              </>
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin text-[#E11D48]' : ''}`}
+                    aria-hidden="true"
+                  />
+                </button>
+
+                {showRefreshMenu && !isRefreshing && (
+                  <div
+                    role="menu"
+                    aria-label="Transcript refresh options"
+                    className="absolute right-0 z-30 mt-2 w-72 overflow-hidden rounded-xl border border-[#E2E8F0] bg-white p-1.5 shadow-lg"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      disabled={!canRefreshFromCachedAudio}
+                      onClick={() => {
+                        setShowRefreshMenu(false);
+                        onRefreshTranscript(job, 'audio');
+                      }}
+                      className="flex w-full flex-col items-start rounded-lg px-3 py-2 text-left transition-colors hover:bg-[#F8FAFC] disabled:cursor-not-allowed disabled:opacity-45 cursor-pointer"
+                    >
+                      <span className="text-xs font-semibold text-[#0F172A]">
+                        Re-transcribe cached Drive audio
+                      </span>
+                      <span className="mt-0.5 text-[11px] leading-snug text-[#64748B]">
+                        {canRefreshFromCachedAudio
+                          ? 'Skips video download · regenerates transcript & updates Drive'
+                          : 'No cached Drive audio available for this clip'}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setShowRefreshMenu(false);
+                        onRefreshTranscript(job, 'fresh');
+                      }}
+                      className="mt-0.5 flex w-full flex-col items-start rounded-lg px-3 py-2 text-left transition-colors hover:bg-[#F8FAFC] cursor-pointer"
+                    >
+                      <span className="text-xs font-semibold text-[#0F172A]">
+                        Re-extract &amp; transcribe fresh
+                      </span>
+                      <span className="mt-0.5 text-[11px] leading-snug text-[#64748B]">
+                        Downloads audio from the original link and refreshes Drive cache
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
             )}
+
+            <button
+              type="button"
+              onClick={handleTriggerDelete}
+              aria-label="Delete transcript"
+              title="Delete transcript"
+              className="inline-flex items-center justify-center rounded-lg border border-[#E2E8F0] bg-white p-2 text-[#64748B] transition-colors hover:border-[#FECDD3] hover:text-[#BE123C] cursor-pointer"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
           </div>
         </div>
 
-        {/* Export Controls */}
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => handleExport('srt')}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+        {/* Inline Refresh Progress Bar */}
+        {isRefreshing && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-lg border border-[#E2E8F0] bg-white p-3.5"
           >
-            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-            SRT
-          </button>
-          <button
-            type="button"
-            onClick={() => handleExport('vtt')}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="inline-flex items-center gap-2 font-medium text-[#0F172A]">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-[#E11D48]" aria-hidden="true" />
+                {refreshDetail || 'Refreshing transcript...'}
+              </span>
+              <span className="font-mono tabular-nums text-[#64748B]">
+                {Math.max(8, Math.min(100, Math.round(refreshProgressPct)))}%
+              </span>
+            </div>
+            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#E2E8F0]">
+              <div
+                className="h-full rounded-full bg-[#E11D48] transition-all duration-300"
+                style={{ width: `${Math.max(8, Math.min(100, refreshProgressPct || 15))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Inline Refresh Error Alert */}
+        {refreshError && !isRefreshing && (
+          <div
+            role="alert"
+            className="flex items-center justify-between gap-3 rounded-lg border border-[#FECDD3] bg-[#FFF1F2] px-4 py-2.5 text-xs text-[#881337]"
           >
-            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-            VTT
-          </button>
-          <button
-            type="button"
-            onClick={() => handleExport('txt')}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
-          >
-            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-            TXT
-          </button>
-          <button
-            type="button"
-            onClick={() => handleExport('json')}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-2 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
-          >
-            <Download className="h-3.5 w-3.5" aria-hidden="true" />
-            JSON
-          </button>
-          <button
-            type="button"
-            onClick={handleCopyTranscript}
-            className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#0F172A] px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-[#1E293B] cursor-pointer"
-          >
-            {copiedState ? (
-              <>
-                <Check className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
-                {copiedState}
-              </>
-            ) : (
-              <>
-                <Copy className="h-3.5 w-3.5" aria-hidden="true" />
-                Copy
-              </>
+            <span>{refreshError}</span>
+            {onDismissRefreshError && (
+              <button
+                type="button"
+                onClick={onDismissRefreshError}
+                aria-label="Dismiss refresh error"
+                className="shrink-0 p-1 text-[#881337] hover:text-[#4C0519] cursor-pointer"
+              >
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
             )}
-          </button>
-          <button
-            type="button"
-            onClick={() => onDeleteJob(job.id)}
-            aria-label="Delete transcript from history"
-            title="Remove transcript"
-            className="inline-flex items-center justify-center rounded-lg border border-[#E2E8F0] bg-white p-2 text-[#64748B] transition-colors hover:border-[#FECDD3] hover:text-[#BE123C] cursor-pointer"
-          >
-            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
       {/* Main Split Studio Grid */}
@@ -323,8 +557,8 @@ export function StudioWorkspace({
             ) : job.mediaKind === 'audio' && playableSrc ? (
               <div className="flex flex-col justify-between gap-4 p-5">
                 <div className="flex items-center justify-between text-xs text-slate-300">
-                  <span className="truncate font-medium text-white">
-                    {job.fileName || job.title}
+                  <span title={job.fileName || job.title} className="truncate font-medium text-white">
+                    {truncateTitle(job.fileName || job.title, 50)}
                   </span>
                   <span className="font-mono tabular-nums">
                     {formatDisplayTimestamp(currentTime)} / {formatDisplayTimestamp(job.durationSeconds)}
@@ -609,6 +843,14 @@ export function StudioWorkspace({
           </div>
         </div>
       </div>
+
+      <ConfirmDeleteModal
+        job={pendingDelete ? job : null}
+        isDeleting={isDeleting}
+        onCancel={() => setPendingDelete(false)}
+        onConfirmLocalOnly={() => void handleConfirmDelete(false)}
+        onConfirmDeleteDrive={() => void handleConfirmDelete(true)}
+      />
     </section>
   );
 }

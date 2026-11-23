@@ -133,6 +133,43 @@ export function slugifyFilename(title: string): string {
   return cleaned || 'transcript';
 }
 
+export function truncateTitle(title: string, maxChars = 50): string {
+  const cleaned = (title || 'Untitled Transcript').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return 'Untitled Transcript';
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, maxChars).trimEnd()}…`;
+}
+
+export function getSourceShortLabel(sourceType: TranscriptJob['sourceType']): string {
+  switch (sourceType) {
+    case 'facebook':
+      return 'FB';
+    case 'instagram':
+      return 'Insta';
+    case 'youtube':
+      return 'YT';
+    case 'direct_url':
+      return 'URL';
+    case 'file_upload':
+    default:
+      return 'Upload';
+  }
+}
+
+export function formatDriveVideoFolderName(
+  sourceType: TranscriptJob['sourceType'],
+  title: string
+): string {
+  const prefix = getSourceShortLabel(sourceType);
+  const sanitized = (title || 'Untitled Video')
+    .replace(/[\\/:*?"<>|\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 50)
+    .trim();
+  return `${prefix} - ${sanitized || 'Untitled Video'}`;
+}
+
 export function triggerFileDownload(content: string, filename: string, mimeType: string): void {
   const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);

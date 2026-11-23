@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   FileText,
+  HardDrive,
   Image as ImageIcon,
   Loader2,
   RefreshCw,
@@ -23,12 +24,15 @@ import {
   serializeToTXT,
   slugifyFilename,
   triggerFileDownload,
+  truncateTitle,
 } from '../utils/exporters';
 
 interface GenAiAnalysisViewProps {
   jobs: TranscriptJob[];
   initialSelectedJobId?: string | null;
-  onSaveAnalysis: (jobId: string, analysis: TranscriptAnalysisResult) => void;
+  onSaveAnalysis: (jobId: string, analysis: TranscriptAnalysisResult) => Promise<boolean> | void;
+  onSyncJobToDrive?: (jobId: string) => Promise<boolean>;
+  driveEnabled?: boolean;
   onGoToStudio: () => void;
 }
 
@@ -284,6 +288,8 @@ export function GenAiAnalysisView({
   jobs,
   initialSelectedJobId,
   onSaveAnalysis,
+  onSyncJobToDrive,
+  driveEnabled = false,
   onGoToStudio,
 }: GenAiAnalysisViewProps) {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(
@@ -296,6 +302,7 @@ export function GenAiAnalysisView({
   const [customRefFile, setCustomRefFile] = useState<File | null>(null);
   const [showRefPreview, setShowRefPreview] = useState(false);
   const [analyzingJobId, setAnalyzingJobId] = useState<string | null>(null);
+  const [syncingDriveJobId, setSyncingDriveJobId] = useState<string | null>(null);
   const [stageLabel, setStageLabel] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [displayMode, setDisplayMode] = useState<'formatted' | 'raw'>('formatted');
@@ -408,7 +415,17 @@ export function GenAiAnalysisView({
         setStageLabel(pollData.stageLabel);
 
         if (pollData.status === 'completed' && pollData.analysis) {
-          onSaveAnalysis(job.id, pollData.analysis);
+          if (driveEnabled) {
+            setSyncingDriveJobId(job.id);
+            setStageLabel('Saving Gen AI Analysis to Google Drive folder...');
+            try {
+              await onSaveAnalysis(job.id, pollData.analysis);
+            } finally {
+              setSyncingDriveJobId(null);
+            }
+          } else {
+            await onSaveAnalysis(job.id, pollData.analysis);
+          }
           return;
         }
 
@@ -553,6 +570,7 @@ export function GenAiAnalysisView({
                   <button
                     key={job.id}
                     type="button"
+                    title={job.title}
                     onClick={() => {
                       setSelectedJobId(job.id);
                       setErrorMessage(null);
@@ -563,8 +581,8 @@ export function GenAiAnalysisView({
                         : 'border-[#E2E8F0] bg-white hover:border-[#94A3B8]'
                     }`}
                   >
-                    <p className="line-clamp-2 text-sm font-medium text-[#0F172A]">
-                      {job.title}
+                    <p className="truncate text-sm font-medium text-[#0F172A]">
+                      {truncateTitle(job.title, 50)}
                     </p>
                     <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
                       <span className="font-mono tabular-nums text-[#64748B]">
@@ -599,17 +617,76 @@ export function GenAiAnalysisView({
             <div className="rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6">
               <div className="flex flex-col gap-4 border-b border-[#E2E8F0] pb-5 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
-                  <h2 className="text-lg font-semibold tracking-tight text-[#0F172A]">
-                    {selectedJob.title}
+                  <h2
+                    title={selectedJob.title}
+                    className="text-lg font-semibold tracking-tight text-[#0F172A]"
+                  >
+                    {truncateTitle(selectedJob.title, 50)}
                   </h2>
-                  <p className="mt-1 text-xs text-[#64748B]">
-                    {selectedJob.language} · {formatDisplayTimestamp(selectedJob.durationSeconds)} · {selectedJob.segments.length} transcript segments
+                  <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[#64748B]">
+                    <span>
+                      {selectedJob.language} · {formatDisplayTimestamp(selectedJob.durationSeconds)} · {selectedJob.segments.length} transcript segments
+                    </span>
                     {selectedJob.analysis && (
                       <>
-                        {' '}· Engine: <span className="text-[#334155]">{selectedJob.analysis.engineUsed}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>
+                          Engine: <span className="text-[#334155]">{selectedJob.analysis.engineUsed}</span>
+                        </span>
                       </>
                     )}
-                  </p>
+                    {selectedJob.analysis && syncingDriveJobId === selectedJob.id && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="inline-flex items-center gap-1 font-medium text-[#475569]">
+                          <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                          Saving analysis to Drive...
+                        </span>
+                      </>
+                    )}
+                    {selectedJob.analysis &&
+                      syncingDriveJobId !== selectedJob.id &&
+                      selectedJob.driveTranscriptFileIds?.analysisMdId && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span
+                            title={
+                              selectedJob.driveFolderName
+                                ? `CueScript/${selectedJob.driveFolderName}/analysis.md`
+                                : 'Saved in Google Drive video folder'
+                            }
+                            className="inline-flex items-center gap-1 font-medium text-[#16A34A]"
+                          >
+                            <HardDrive className="h-3 w-3" aria-hidden="true" />
+                            Analysis cached in Drive
+                          </span>
+                        </>
+                      )}
+                    {selectedJob.analysis &&
+                      syncingDriveJobId !== selectedJob.id &&
+                      driveEnabled &&
+                      !selectedJob.driveTranscriptFileIds?.analysisMdId &&
+                      onSyncJobToDrive && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              setSyncingDriveJobId(selectedJob.id);
+                              try {
+                                await onSyncJobToDrive(selectedJob.id);
+                              } finally {
+                                setSyncingDriveJobId(null);
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 font-medium text-[#0F172A] underline underline-offset-4 hover:text-[#E11D48] cursor-pointer"
+                          >
+                            <HardDrive className="h-3 w-3" aria-hidden="true" />
+                            Save analysis to Drive
+                          </button>
+                        </>
+                      )}
+                  </div>
                 </div>
 
                 <div className="flex shrink-0 flex-wrap items-center gap-2">

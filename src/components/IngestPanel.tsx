@@ -1,7 +1,17 @@
 import { useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent, FormEvent } from 'react';
-import { AlertTriangle, ArrowRight, FileAudio, Link2, Loader2, Upload } from 'lucide-react';
-import type { MediaPlatform, TranscribeApiError } from '../types/transcript';
+import {
+  AlertTriangle,
+  ArrowRight,
+  FileAudio,
+  HardDrive,
+  Link2,
+  Loader2,
+  Lock,
+  RefreshCw,
+  Upload,
+} from 'lucide-react';
+import type { DriveStatusResponse, MediaPlatform, TranscribeApiError } from '../types/transcript';
 import { detectPlatformFromInput } from '../utils/exporters';
 
 interface IngestPanelProps {
@@ -13,13 +23,19 @@ interface IngestPanelProps {
   onSubmitUrl: (url: string) => void;
   onUploadFile: (file: File, context?: { sourceUrl?: string; sourcePlatform?: MediaPlatform }) => void;
   compact?: boolean;
+  driveStatus: DriveStatusResponse | null;
+  isSyncingLibrary: boolean;
+  onOpenDriveSetup: () => void;
+  onSyncDriveLibrary: () => void;
+  onUnlockDrive: (passcode: string) => Promise<string | null>;
+  onLockDrive: () => void;
 }
 
 const PIPELINE_STEPS = [
-  'Validating source & platform',
-  'Extracting & normalizing audio (yt-dlp + FFmpeg)',
+  'Validating source & Drive cache',
+  'Extracting or reusing audio track',
   'Transcribing speech & diarizing speakers',
-  'Building chapter timeline & exports',
+  'Archiving & building exports',
 ];
 
 const ACCEPTED_EXTENSIONS = '.mp4,.mov,.webm,.mp3,.wav,.m4a,.ogg,.aac,audio/*,video/*';
@@ -33,14 +49,39 @@ export function IngestPanel({
   onSubmitUrl,
   onUploadFile,
   compact = false,
+  driveStatus,
+  isSyncingLibrary,
+  onOpenDriveSetup,
+  onSyncDriveLibrary,
+  onUnlockDrive,
+  onLockDrive,
 }: IngestPanelProps) {
   const [mode, setMode] = useState<'url' | 'upload'>('url');
   const [urlInput, setUrlInput] = useState('');
   const [isDragging, setIsDragging] = useState(false);
+  const [showPasscodeForm, setShowPasscodeForm] = useState(false);
+  const [passcodeDraft, setPasscodeDraft] = useState('');
+  const [passcodeError, setPasscodeError] = useState<string | null>(null);
+  const [isUnlocking, setIsUnlocking] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const detected = detectPlatformFromInput(urlInput);
   const isLoginWallFallback = errorState?.code === 'LOGIN_WALL_FALLBACK';
+
+  async function handleUnlockSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!passcodeDraft.trim() || isUnlocking) return;
+    setIsUnlocking(true);
+    setPasscodeError(null);
+    const err = await onUnlockDrive(passcodeDraft);
+    setIsUnlocking(false);
+    if (err) {
+      setPasscodeError(err);
+    } else {
+      setPasscodeDraft('');
+      setShowPasscodeForm(false);
+    }
+  }
 
   function handleUrlFormSubmit(e: FormEvent) {
     e.preventDefault();
@@ -329,6 +370,145 @@ export function IngestPanel({
           </div>
         </div>
       )}
+
+      {/* Personal Google Drive Bridge Strip (Zero Google Sign-In UI) */}
+      <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-[#F1F5F9] pt-4 text-xs">
+        {driveStatus?.configured && driveStatus.unlocked && driveStatus.reachable ? (
+          <>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[#475569]">
+              <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#16A34A]" aria-hidden="true" />
+              <span className="font-medium text-[#0F172A]">
+                Personal Drive connected ({driveStatus.folderName || 'CueScript'}/)
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>Cached links open automatically</span>
+              {typeof driveStatus.transcriptCount === 'number' && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono tabular-nums text-[#64748B]">
+                    {driveStatus.transcriptCount} saved
+                  </span>
+                </>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onSyncDriveLibrary}
+                disabled={isSyncingLibrary}
+                className="inline-flex items-center gap-1 whitespace-nowrap font-medium text-[#0F172A] transition-colors hover:text-[#E11D48] disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw
+                  className={`h-3 w-3 ${isSyncingLibrary ? 'animate-spin' : ''}`}
+                  aria-hidden="true"
+                />
+                {isSyncingLibrary ? 'Syncing' : 'Sync Library'}
+              </button>
+              {driveStatus.requiresPasscode && (
+                <button
+                  type="button"
+                  onClick={onLockDrive}
+                  className="inline-flex items-center gap-1 whitespace-nowrap font-medium text-[#64748B] transition-colors hover:text-[#0F172A] cursor-pointer"
+                >
+                  <Lock className="h-3 w-3" aria-hidden="true" />
+                  Lock
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onOpenDriveSetup}
+                className="whitespace-nowrap text-[#64748B] underline underline-offset-4 transition-colors hover:text-[#0F172A] cursor-pointer"
+              >
+                Setup Guide
+              </button>
+            </div>
+          </>
+        ) : driveStatus?.configured && driveStatus.requiresPasscode && !driveStatus.unlocked ? (
+          <div className="flex w-full flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-[#475569]">
+              <Lock className="h-3.5 w-3.5 shrink-0 text-[#64748B]" aria-hidden="true" />
+              <span>
+                Personal Drive locked — transcripts stay in local browser storage until unlocked
+              </span>
+            </div>
+
+            {showPasscodeForm ? (
+              <form onSubmit={handleUnlockSubmit} className="flex flex-wrap items-center gap-2">
+                <input
+                  type="password"
+                  value={passcodeDraft}
+                  onChange={(e) => setPasscodeDraft(e.target.value)}
+                  placeholder="Owner passcode"
+                  aria-label="Owner passcode"
+                  autoFocus
+                  className="h-8 w-40 rounded-md border border-[#CBD5E1] bg-white px-2.5 text-xs text-[#0F172A] focus:border-[#0F172A]"
+                />
+                <button
+                  type="submit"
+                  disabled={isUnlocking || !passcodeDraft.trim()}
+                  className="h-8 whitespace-nowrap rounded-md bg-[#0F172A] px-3 text-xs font-medium text-white transition-colors hover:bg-[#1E293B] disabled:opacity-50 cursor-pointer"
+                >
+                  {isUnlocking ? 'Checking...' : 'Unlock'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowPasscodeForm(false);
+                    setPasscodeError(null);
+                  }}
+                  className="text-xs text-[#64748B] hover:text-[#0F172A] cursor-pointer"
+                >
+                  Cancel
+                </button>
+                {passcodeError && (
+                  <span className="text-xs font-medium text-[#BE123C]">{passcodeError}</span>
+                )}
+              </form>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowPasscodeForm(true)}
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+              >
+                <Lock className="h-3 w-3" aria-hidden="true" />
+                Unlock Personal Drive
+              </button>
+            )}
+          </div>
+        ) : driveStatus?.configured && !driveStatus.reachable ? (
+          <>
+            <div className="flex items-center gap-2 text-[#92400E]">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[#D97706]" aria-hidden="true" />
+              <span>
+                Personal Drive Bridge unreachable ({driveStatus.error || 'redeploy Apps Script Version 2'})
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={onOpenDriveSetup}
+              className="whitespace-nowrap rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-3 py-1.5 text-xs font-medium text-[#92400E] transition-colors hover:border-[#D97706] cursor-pointer"
+            >
+              Open Setup Guide
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="flex items-center gap-2 text-[#475569]">
+              <HardDrive className="h-3.5 w-3.5 shrink-0 text-[#64748B]" aria-hidden="true" />
+              <span>
+                Personal Google Drive caching not connected yet — saving locally in browser
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={onOpenDriveSetup}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#CBD5E1] bg-white px-3 py-1.5 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
+            >
+              Complete Drive Setup
+            </button>
+          </>
+        )}
+      </div>
     </section>
   );
 }

@@ -28,6 +28,13 @@ export interface TranscriptAnalysisResult {
   referenceImageName: string;
 }
 
+export interface DriveTranscriptFileIds {
+  jsonId?: string;
+  srtId?: string;
+  txtId?: string;
+  analysisMdId?: string;
+}
+
 export interface TranscriptJob {
   id: string;
   createdAt: string;
@@ -39,7 +46,7 @@ export interface TranscriptJob {
   mediaKind: 'youtube' | 'video' | 'audio' | 'none';
   /** Ephemeral client-side Object URL for local playback during active session */
   localMediaUrl?: string;
-  /** Public extracted media stream URL when available */
+  /** Public extracted media stream URL or durable Drive audio proxy URL */
   remoteMediaUrl?: string;
   thumbnailUrl?: string;
   title: string;
@@ -53,11 +60,41 @@ export interface TranscriptJob {
   segments: TranscriptSegment[];
   extractionMethod: string;
   analysis?: TranscriptAnalysisResult;
+  /** Deterministic canonical key used for Google Drive cache lookup */
+  sourceKey?: string;
+  /** Dedicated per-video Google Drive folder ID under CueScript/ */
+  driveFolderId?: string;
+  /** Dedicated per-video Google Drive folder name, e.g. "FB - Video title" */
+  driveFolderName?: string;
+  /** Google Drive file ID of archived audio track inside the video's Drive folder */
+  driveAudioFileId?: string;
+  driveAudioMimeType?: string;
+  driveTranscriptFileIds?: DriveTranscriptFileIds;
+  syncedToDrive?: boolean;
+  loadedFromCache?: boolean;
+  syncedAt?: string;
 }
+
+export interface DriveStatusResponse {
+  ok: true;
+  configured: boolean;
+  requiresPasscode: boolean;
+  unlocked: boolean;
+  reachable: boolean;
+  folderName?: string;
+  audioCount?: number;
+  transcriptCount?: number;
+  videoFolderCount?: number;
+  configError?: string | null;
+  error?: string;
+}
+
+export type RefreshMode = 'audio' | 'fresh';
 
 export interface TranscribeApiSuccess {
   ok: true;
   job: Omit<TranscriptJob, 'localMediaUrl'>;
+  fromCache?: boolean;
 }
 
 export interface TranscribeApiError {

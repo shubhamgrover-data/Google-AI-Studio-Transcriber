@@ -13,6 +13,30 @@ import multer from 'multer';
 import ffmpegStatic from 'ffmpeg-static';
 import Groq from 'groq-sdk';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import {
+  APPS_SCRIPT_BRIDGE_CODE,
+  APPS_SCRIPT_MANIFEST_JSON,
+  computeSourceKey,
+  downloadDriveAudioToTemp,
+  formatDriveVideoFolderName,
+  getBridgeConfigurationError,
+  isDriveBridgeConfigured,
+  isDriveRequestAuthorized,
+  isPasscodeRequired,
+  isValidDriveFileId,
+  isValidSourceKey,
+  listDriveLibrary,
+  lookupDriveCache,
+  mintOwnerSessionToken,
+  pingDriveBridge,
+  saveAudioFileToDrive,
+  saveTranscriptBundleToDrive,
+  trashDriveEntry,
+  verifyOwnerPasscode,
+  type DriveJobPayload,
+  type DriveLookupResult,
+  type DriveTranscriptFileIds,
+} from './server/driveBridge.ts';
 
 dotenv.config();
 
@@ -779,6 +803,15 @@ function normalizeTranscriptResult(
     fallbackTitle: string;
     author?: string;
     extractionMethod: string;
+    sourceKey?: string;
+    driveFolderId?: string;
+    driveFolderName?: string;
+    driveAudioFileId?: string;
+    driveAudioMimeType?: string;
+    driveTranscriptFileIds?: DriveTranscriptFileIds;
+    syncedToDrive?: boolean;
+    loadedFromCache?: boolean;
+    syncedAt?: string;
   }
 ) {
   const rawSegments = Array.isArray(raw.segments) ? raw.segments : [];
@@ -851,6 +884,15 @@ function normalizeTranscriptResult(
     chapters,
     segments,
     extractionMethod: meta.extractionMethod,
+    sourceKey: meta.sourceKey,
+    driveFolderId: meta.driveFolderId,
+    driveFolderName: meta.driveFolderName,
+    driveAudioFileId: meta.driveAudioFileId,
+    driveAudioMimeType: meta.driveAudioMimeType,
+    driveTranscriptFileIds: meta.driveTranscriptFileIds,
+    syncedToDrive: meta.syncedToDrive,
+    loadedFromCache: meta.loadedFromCache,
+    syncedAt: meta.syncedAt,
   };
 }
 
@@ -2384,6 +2426,315 @@ async function startServer() {
     createReadStream(entry.filePath).pipe(res);
   });
 
+  // --- Headless Personal Google Drive Bridge API ---
+  app.get('/api/drive/status', async (req: Request, res: Response) => {
+    const configured = isDriveBridgeConfigured();
+    const requiresPasscode = isPasscodeRequired();
+    const unlocked = isDriveRequestAuthorized(req);
+    const configError = getBridgeConfigurationError();
+
+    if (!configured) {
+      res.json({
+        ok: true,
+        configured: false,
+        requiresPasscode,
+        unlocked,
+        reachable: false,
+        configError,
+      });
+      return;
+    }
+
+    if (!unlocked) {
+      res.json({
+        ok: true,
+        configured: true,
+        requiresPasscode: true,
+        unlocked: false,
+        reachable: true,
+      });
+      return;
+    }
+
+    const ping = await pingDriveBridge();
+    res.json({
+      ok: true,
+      configured: true,
+      requiresPasscode,
+      unlocked: true,
+      reachable: ping.ok,
+      folderName: ping.folderName,
+      audioCount: ping.audioCount,
+      transcriptCount: ping.transcriptCount,
+      videoFolderCount: ping.videoFolderCount,
+      error: ping.ok ? undefined : ping.error,
+    });
+  });
+
+  app.post('/api/drive/unlock', (req: Request, res: Response) => {
+    if (!isPasscodeRequired()) {
+      res.json({ ok: true, unlocked: true, token: mintOwnerSessionToken() });
+      return;
+    }
+    const candidate = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
+    if (!verifyOwnerPasscode(candidate)) {
+      res.status(401).json({ ok: false, message: 'Incorrect passcode.' });
+      return;
+    }
+    res.json({ ok: true, unlocked: true, token: mintOwnerSessionToken() });
+  });
+
+  app.get('/api/drive/setup-script', (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      manifest: APPS_SCRIPT_MANIFEST_JSON,
+      script: APPS_SCRIPT_BRIDGE_CODE,
+    });
+  });
+
+  app.get('/api/drive/library', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.json({ ok: true, jobs: [] });
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Personal Drive is locked.' });
+      return;
+    }
+    try {
+      const jobs = await listDriveLibrary(30);
+      res.json({ ok: true, jobs });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Could not load Drive library.',
+      });
+    }
+  });
+
+  app.get('/api/drive/audio/:fileId', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.status(404).end();
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Personal Drive is locked.' });
+      return;
+    }
+    const fileId = req.params.fileId || '';
+    if (!isValidDriveFileId(fileId)) {
+      res.status(400).end();
+      return;
+    }
+    try {
+      const cached = await downloadDriveAudioToTemp(fileId);
+      const stat = statSync(cached.filePath);
+      const total = stat.size;
+      const range = req.headers.range;
+
+      res.setHeader('Content-Type', cached.mimeType);
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Cache-Control', 'private, max-age=1800');
+
+      if (range) {
+        const match = range.match(/bytes=(\d*)-(\d*)/);
+        if (match) {
+          const start = match[1] ? Number(match[1]) : 0;
+          const end = match[2] ? Math.min(Number(match[2]), total - 1) : total - 1;
+          if (start >= total || end < start) {
+            res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+            return;
+          }
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          createReadStream(cached.filePath, { start, end }).pipe(res);
+          return;
+        }
+      }
+
+      res.setHeader('Content-Length', String(total));
+      createReadStream(cached.filePath).pipe(res);
+    } catch (err) {
+      console.warn('Drive audio proxy error:', err instanceof Error ? err.message : err);
+      res.status(502).json({ ok: false, message: 'Could not stream Drive audio.' });
+    }
+  });
+
+  app.put('/api/drive/transcripts/:sourceKey', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.status(400).json({ ok: false, message: 'Drive Bridge is not configured.' });
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Personal Drive is locked.' });
+      return;
+    }
+    const sourceKey = req.params.sourceKey || '';
+    if (!isValidSourceKey(sourceKey)) {
+      res.status(400).json({ ok: false, message: 'Invalid sourceKey.' });
+      return;
+    }
+    const job = req.body?.job as DriveJobPayload | undefined;
+    if (!job || typeof job.title !== 'string' || !Array.isArray(job.segments)) {
+      res.status(400).json({ ok: false, message: 'Invalid transcript payload.' });
+      return;
+    }
+    try {
+      const saved = await saveTranscriptBundleToDrive(sourceKey, {
+        ...job,
+        sourceKey,
+        loadedFromCache: false,
+      });
+      res.json({
+        ok: true,
+        driveFolderId: saved.folderId,
+        driveFolderName: saved.folderName,
+        transcriptFiles: saved.transcriptFiles,
+        syncedAt: saved.syncedAt,
+      });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Could not update transcript in Drive.',
+      });
+    }
+  });
+
+  app.delete('/api/drive/transcripts/:sourceKey', async (req: Request, res: Response) => {
+    if (!isDriveBridgeConfigured()) {
+      res.status(400).json({ ok: false, message: 'Drive Bridge is not configured.' });
+      return;
+    }
+    if (!isDriveRequestAuthorized(req)) {
+      res.status(401).json({ ok: false, message: 'Personal Drive is locked.' });
+      return;
+    }
+    const sourceKey = req.params.sourceKey || '';
+    if (!isValidSourceKey(sourceKey)) {
+      res.status(400).json({ ok: false, message: 'Invalid sourceKey.' });
+      return;
+    }
+    try {
+      const result = await trashDriveEntry(sourceKey);
+      res.json({ ok: true, trashedCount: result.trashedCount });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Could not move Drive files to Trash.',
+      });
+    }
+  });
+
+  async function archiveJobToDriveIfEnabled(params: {
+    driveEnabled: boolean;
+    sourceKey: string;
+    job: ReturnType<typeof normalizeTranscriptResult>;
+    audioPath?: string;
+    audioBuffer?: Buffer;
+    audioMimeType?: string;
+    existingDriveAudioFileId?: string;
+    existingDriveAudioMimeType?: string;
+    onProgress?: ProgressUpdater;
+  }): Promise<ReturnType<typeof normalizeTranscriptResult>> {
+    const jobWithKey = {
+      ...params.job,
+      sourceKey: params.sourceKey,
+    };
+
+    if (!params.driveEnabled || !isDriveBridgeConfigured()) {
+      return jobWithKey;
+    }
+
+    let driveAudioFileId = params.existingDriveAudioFileId || jobWithKey.driveAudioFileId;
+    let driveAudioMimeType = params.existingDriveAudioMimeType || jobWithKey.driveAudioMimeType;
+    let driveFolderId = jobWithKey.driveFolderId;
+    let driveFolderName =
+      jobWithKey.driveFolderName ||
+      formatDriveVideoFolderName(jobWithKey.sourceType, jobWithKey.title);
+    let tempAudioPath: string | null = null;
+
+    try {
+      params.onProgress?.(3, 'Saving video folder (audio & transcripts) to Google Drive...', 96);
+
+      if (!driveAudioFileId && (params.audioPath || params.audioBuffer)) {
+        let pathToSave = params.audioPath;
+        const mime = params.audioMimeType || 'audio/mp4';
+        if (!pathToSave && params.audioBuffer) {
+          const ext = mime.includes('mpeg') ? '.mp3' : mime.includes('wav') ? '.wav' : '.m4a';
+          tempAudioPath = path.join(
+            os.tmpdir(),
+            `cuescript_drive_buf_${crypto.randomBytes(6).toString('hex')}${ext}`
+          );
+          await fs.writeFile(tempAudioPath, params.audioBuffer);
+          pathToSave = tempAudioPath;
+        }
+        if (pathToSave) {
+          try {
+            const uploadedAudio = await saveAudioFileToDrive({
+              sourceKey: params.sourceKey,
+              audioPath: pathToSave,
+              mimeType: mime,
+              ffmpegBin: FFMPEG_BIN,
+              sourceType: jobWithKey.sourceType,
+              title: jobWithKey.title,
+              folderName: driveFolderName,
+            });
+            driveAudioFileId = uploadedAudio.fileId;
+            driveAudioMimeType = uploadedAudio.mimeType;
+            if (uploadedAudio.folderId) driveFolderId = uploadedAudio.folderId;
+            if (uploadedAudio.folderName) driveFolderName = uploadedAudio.folderName;
+          } catch (audioErr) {
+            console.warn(
+              'Drive audio upload skipped:',
+              audioErr instanceof Error ? audioErr.message : audioErr
+            );
+          }
+        }
+      }
+
+      const enrichedJob = {
+        ...jobWithKey,
+        driveFolderId,
+        driveFolderName,
+        driveAudioFileId,
+        driveAudioMimeType,
+        ...(jobWithKey.mediaKind !== 'youtube' && driveAudioFileId
+          ? {
+              mediaKind: 'audio' as const,
+              remoteMediaUrl: `/api/drive/audio/${driveAudioFileId}`,
+            }
+          : {}),
+      };
+
+      const savedBundle = await saveTranscriptBundleToDrive(params.sourceKey, enrichedJob);
+      return {
+        ...enrichedJob,
+        driveFolderId: savedBundle.folderId || driveFolderId,
+        driveFolderName: savedBundle.folderName || driveFolderName,
+        driveTranscriptFileIds: savedBundle.transcriptFiles,
+        syncedToDrive: true,
+        loadedFromCache: false,
+        syncedAt: savedBundle.syncedAt,
+      };
+    } catch (driveErr) {
+      console.warn(
+        'Drive transcript archive failed (returning local result):',
+        driveErr instanceof Error ? driveErr.message : driveErr
+      );
+      return {
+        ...jobWithKey,
+        driveAudioFileId,
+        driveAudioMimeType,
+        syncedToDrive: false,
+      };
+    } finally {
+      if (tempAudioPath) {
+        await fs.unlink(tempAudioPath).catch(() => {});
+      }
+    }
+  }
+
   interface AsyncJobRecord {
     asyncJobId: string;
     status: 'queued' | 'processing' | 'completed' | 'failed';
@@ -2446,8 +2797,20 @@ async function startServer() {
     });
   });
 
-  app.post('/api/transcribe/url', (req: Request, res: Response) => {
+  app.post('/api/transcribe/url', async (req: Request, res: Response) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
+    const refreshModeRaw = typeof req.body?.refreshMode === 'string' ? req.body.refreshMode : 'none';
+    const refreshMode: 'none' | 'audio' | 'fresh' =
+      refreshModeRaw === 'audio' || refreshModeRaw === 'fresh' ? refreshModeRaw : 'none';
+    const existingDriveAudioFileId =
+      typeof req.body?.driveAudioFileId === 'string' && isValidDriveFileId(req.body.driveAudioFileId)
+        ? req.body.driveAudioFileId
+        : undefined;
+    const existingTitle = typeof req.body?.existingTitle === 'string' ? req.body.existingTitle.trim() : undefined;
+    const existingAuthor = typeof req.body?.existingAuthor === 'string' ? req.body.existingAuthor.trim() : undefined;
+    const existingThumbnailUrl =
+      typeof req.body?.existingThumbnailUrl === 'string' ? req.body.existingThumbnailUrl.trim() : undefined;
+
     const classified = classifyUrl(rawUrl);
 
     if (!classified) {
@@ -2461,7 +2824,41 @@ async function startServer() {
     }
 
     const { parsedUrl, platform, youtubeId } = classified;
-    const record = createAsyncJob(`Preparing ${platform} transcription pipeline...`);
+    const sourceKey = computeSourceKey({ platform, youtubeId, parsedUrl });
+    const driveEnabled = isDriveBridgeConfigured() && isDriveRequestAuthorized(req);
+
+    // Pre-flight Google Drive cache check (auto-open instantly on full transcript hit)
+    let driveLookup: DriveLookupResult | null = null;
+    if (driveEnabled && refreshMode !== 'fresh') {
+      try {
+        driveLookup = await lookupDriveCache(sourceKey);
+        if (refreshMode === 'none' && driveLookup.hasTranscript && driveLookup.transcriptJob) {
+          res.json({
+            ok: true,
+            job: driveLookup.transcriptJob,
+            fromCache: true,
+          });
+          return;
+        }
+      } catch (lookupErr) {
+        console.warn(
+          'Pre-flight Drive lookup skipped:',
+          lookupErr instanceof Error ? lookupErr.message : lookupErr
+        );
+      }
+    }
+
+    const cachedAudioId =
+      refreshMode === 'fresh'
+        ? undefined
+        : driveLookup?.audioFile?.id || existingDriveAudioFileId;
+    const cachedAudioMime = driveLookup?.audioFile?.mimeType;
+
+    const record = createAsyncJob(
+      cachedAudioId
+        ? 'Loading cached audio from Google Drive...'
+        : `Preparing ${platform} transcription pipeline...`
+    );
     const updateProgress: ProgressUpdater = (stepIndex, stageLabel, progressPct) => {
       record.stepIndex = stepIndex;
       record.stageLabel = stageLabel;
@@ -2477,6 +2874,82 @@ async function startServer() {
     // Execute transcription asynchronously so long videos never hit proxy HTTP timeouts
     void (async () => {
       try {
+        // Fast-path: Reuse Drive-cached audio (for partial cache hits OR "Re-transcribe cached audio")
+        if (driveEnabled && cachedAudioId) {
+          try {
+            updateProgress(1, 'Pulling cached audio from Google Drive (skipping download)...', 22);
+            const driveAudio = await downloadDriveAudioToTemp(cachedAudioId);
+            const canonicalUrl =
+              platform === 'youtube' && youtubeId
+                ? `https://www.youtube.com/watch?v=${youtubeId}`
+                : parsedUrl.toString();
+            const oembed =
+              platform === 'youtube' && youtubeId ? await fetchYouTubeMetadata(canonicalUrl) : {};
+            const probedDuration = await probeAudioDuration(driveAudio.filePath);
+            const fallbackTitle =
+              existingTitle ||
+              driveLookup?.transcriptJob?.title ||
+              oembed.title ||
+              `${platform === 'youtube' ? 'YouTube' : platform === 'facebook' ? 'Facebook' : platform === 'instagram' ? 'Instagram' : 'Media'} Transcript`;
+
+            updateProgress(2, 'Re-transcribing cached Drive audio...', 38);
+            const { payload: parsed, engineLabel } = await transcribeFileWithGroqPrimaryOrGeminiFallback({
+              filePath: driveAudio.filePath,
+              mimeType: cachedAudioMime || driveAudio.mimeType,
+              contextHint: `Platform: ${platform}. Title: ${fallbackTitle}. Source: Cached Drive Audio`,
+              durationHintSeconds: probedDuration,
+              onProgress: updateProgress,
+            });
+
+            const normalized = normalizeTranscriptResult(
+              {
+                ...parsed,
+                durationSeconds: probedDuration || parsed.durationSeconds,
+              },
+              {
+                sourceType: platform,
+                sourceUrl: canonicalUrl,
+                mimeType: driveAudio.mimeType,
+                embedVideoId: youtubeId,
+                mediaKind: platform === 'youtube' && youtubeId ? 'youtube' : 'audio',
+                remoteMediaUrl:
+                  platform === 'youtube' && youtubeId ? undefined : `/api/drive/audio/${cachedAudioId}`,
+                thumbnailUrl:
+                  existingThumbnailUrl ||
+                  driveLookup?.transcriptJob?.thumbnailUrl ||
+                  oembed.thumbnailUrl ||
+                  (youtubeId ? `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg` : undefined),
+                fallbackTitle: fallbackTitle || parsed.title || 'Transcribed Recording',
+                author: existingAuthor || driveLookup?.transcriptJob?.author || oembed.author,
+                extractionMethod: `${engineLabel} via cached Google Drive audio`,
+                sourceKey,
+                driveAudioFileId: cachedAudioId,
+                driveAudioMimeType: driveAudio.mimeType,
+              }
+            );
+
+            record.job = await archiveJobToDriveIfEnabled({
+              driveEnabled,
+              sourceKey,
+              job: normalized,
+              existingDriveAudioFileId: cachedAudioId,
+              existingDriveAudioMimeType: driveAudio.mimeType,
+              onProgress: updateProgress,
+            });
+            record.status = 'completed';
+            record.progressPct = 100;
+            return;
+          } catch (driveAudioErr) {
+            if (refreshMode === 'audio') {
+              throw driveAudioErr;
+            }
+            console.warn(
+              'Cached Drive audio reuse failed; falling back to fresh extraction:',
+              driveAudioErr instanceof Error ? driveAudioErr.message : driveAudioErr
+            );
+          }
+        }
+
         // 1. YouTube: Tier 1 Groq Whisper -> Tier 2 Deepgram Nova-3 (via yt-dlp audio) -> Tier 3 Google Gemini fileUri fallback
         if (platform === 'youtube' && youtubeId) {
           const canonicalUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
@@ -2531,7 +3004,7 @@ async function startServer() {
               }
 
               if (parsed) {
-                record.job = normalizeTranscriptResult(
+                const normalized = normalizeTranscriptResult(
                   {
                     ...parsed,
                     durationSeconds: extractedYt.durationSeconds || parsed.durationSeconds,
@@ -2549,8 +3022,17 @@ async function startServer() {
                       oembed.title || extractedYt.title || parsed.title || 'YouTube Video Transcript',
                     author: oembed.author || extractedYt.author,
                     extractionMethod: `${engineLabel} via yt-dlp native audio`,
+                    sourceKey,
                   }
                 );
+                record.job = await archiveJobToDriveIfEnabled({
+                  driveEnabled,
+                  sourceKey,
+                  job: normalized,
+                  audioPath: extractedYt.audioPath,
+                  audioMimeType: extractedYt.mimeType,
+                  onProgress: updateProgress,
+                });
                 record.status = 'completed';
                 record.progressPct = 100;
                 return;
@@ -2580,7 +3062,7 @@ async function startServer() {
           ]);
 
           updateProgress(3, 'Building chapter timeline & exports...', 92);
-          record.job = normalizeTranscriptResult(parsed, {
+          const normalized = normalizeTranscriptResult(parsed, {
             sourceType: 'youtube',
             sourceUrl: canonicalUrl,
             embedVideoId: youtubeId,
@@ -2592,6 +3074,13 @@ async function startServer() {
               groq || deepgramKey
                 ? 'Google Gemini final fallback (Direct YouTube fileUri)'
                 : 'Google Gemini final fallback (GROQ_API_KEY & DEEPGRAM_API_KEY not configured)',
+            sourceKey,
+          });
+          record.job = await archiveJobToDriveIfEnabled({
+            driveEnabled,
+            sourceKey,
+            job: normalized,
+            onProgress: updateProgress,
           });
           record.status = 'completed';
           record.progressPct = 100;
@@ -2654,7 +3143,7 @@ async function startServer() {
               onProgress: updateProgress,
             });
 
-            record.job = normalizeTranscriptResult(
+            const normalized = normalizeTranscriptResult(
               {
                 ...parsed,
                 durationSeconds: extractedAudio.durationSeconds || parsed.durationSeconds,
@@ -2670,8 +3159,17 @@ async function startServer() {
                   extractedAudio.title || parsed.title || `${platformLabel} Video Transcript`,
                 author: extractedAudio.author,
                 extractionMethod: `${engineLabel} via yt-dlp native audio`,
+                sourceKey,
               }
             );
+            record.job = await archiveJobToDriveIfEnabled({
+              driveEnabled,
+              sourceKey,
+              job: normalized,
+              audioPath: extractedAudio.audioPath,
+              audioMimeType: extractedAudio.mimeType,
+              onProgress: updateProgress,
+            });
             record.status = 'completed';
             record.progressPct = 100;
             return;
@@ -2704,7 +3202,7 @@ async function startServer() {
             onProgress: updateProgress,
           });
 
-          record.job = normalizeTranscriptResult(parsed, {
+          const normalized = normalizeTranscriptResult(parsed, {
             sourceType: platform,
             sourceUrl: parsedUrl.toString(),
             mimeType,
@@ -2713,6 +3211,15 @@ async function startServer() {
             thumbnailUrl: extracted.thumbnailUrl,
             fallbackTitle: extracted.title || parsed.title || `${platformLabel} Video Transcript`,
             extractionMethod: `${engineLabel} via public ${platform} OpenGraph stream`,
+            sourceKey,
+          });
+          record.job = await archiveJobToDriveIfEnabled({
+            driveEnabled,
+            sourceKey,
+            job: normalized,
+            audioBuffer: buffer,
+            audioMimeType: mimeType,
+            onProgress: updateProgress,
           });
           record.status = 'completed';
           record.progressPct = 100;
@@ -2731,7 +3238,7 @@ async function startServer() {
           onProgress: updateProgress,
         });
 
-        record.job = normalizeTranscriptResult(parsed, {
+        const normalized = normalizeTranscriptResult(parsed, {
           sourceType: 'direct_url',
           sourceUrl: parsedUrl.toString(),
           fileName: urlFilename,
@@ -2740,6 +3247,15 @@ async function startServer() {
           remoteMediaUrl: parsedUrl.toString(),
           fallbackTitle: parsed.title || urlFilename,
           extractionMethod: `${engineLabel} via direct media stream`,
+          sourceKey,
+        });
+        record.job = await archiveJobToDriveIfEnabled({
+          driveEnabled,
+          sourceKey,
+          job: normalized,
+          audioBuffer: buffer,
+          audioMimeType: mimeType,
+          onProgress: updateProgress,
         });
         record.status = 'completed';
         record.progressPct = 100;
@@ -2841,7 +3357,17 @@ async function startServer() {
             .replace(/[_-]+/g, ' ')
             .trim();
 
-          record.job = normalizeTranscriptResult(parsed, {
+          const classifiedUploadUrl = sourceUrl ? classifyUrl(sourceUrl) : null;
+          const uploadSourceKey = classifiedUploadUrl
+            ? computeSourceKey({
+                platform: classifiedUploadUrl.platform,
+                youtubeId: classifiedUploadUrl.youtubeId,
+                parsedUrl: classifiedUploadUrl.parsedUrl,
+              })
+            : computeSourceKey({ platform: 'file_upload', fileBuffer: file.buffer });
+          const driveEnabled = isDriveBridgeConfigured() && isDriveRequestAuthorized(req);
+
+          const normalized = normalizeTranscriptResult(parsed, {
             sourceType,
             sourceUrl,
             fileName: file.originalname,
@@ -2852,6 +3378,15 @@ async function startServer() {
               sourceType === 'facebook' || sourceType === 'instagram'
                 ? `${engineLabel} via media upload fallback (${sourceType})`
                 : `${engineLabel} via direct file upload`,
+            sourceKey: uploadSourceKey,
+          });
+          record.job = await archiveJobToDriveIfEnabled({
+            driveEnabled,
+            sourceKey: uploadSourceKey,
+            job: normalized,
+            audioBuffer: file.buffer,
+            audioMimeType: mimeType,
+            onProgress: updateUploadProgress,
           });
           record.status = 'completed';
           record.progressPct = 100;
