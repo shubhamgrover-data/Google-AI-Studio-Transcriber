@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowRight, HardDrive, Sparkles } from 'lucide-react';
+import { HardDrive } from 'lucide-react';
 import { DriveSetupModal } from './components/DriveSetupModal';
 import { GenAiAnalysisView } from './components/GenAiAnalysisView';
 import { IngestPanel } from './components/IngestPanel';
@@ -774,8 +774,8 @@ export default function App() {
                   })}
                 </div>
 
-                <div className="flex shrink-0 items-center gap-2">
-                  {!showIngestForm && driveStatus && !driveEnabled && (
+                {!showIngestForm && driveStatus && !driveEnabled && (
+                  <div className="flex shrink-0 items-center gap-2">
                     <button
                       type="button"
                       onClick={() => {
@@ -792,18 +792,8 @@ export default function App() {
                         ? 'Unlock Drive'
                         : 'Drive Setup'}
                     </button>
-                  )}
-
-                  <button
-                    type="button"
-                    onClick={() => setActiveView('analysis')}
-                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#E2E8F0] bg-white px-3 py-1.5 text-xs font-medium text-[#0F172A] transition-colors hover:border-[#0F172A] cursor-pointer"
-                  >
-                    <Sparkles className="h-3.5 w-3.5 text-[#E11D48]" aria-hidden="true" />
-                    Gen AI Analysis
-                    <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-                  </button>
-                </div>
+                  </div>
+                )}
               </div>
             )}
 
