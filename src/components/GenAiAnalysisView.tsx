@@ -189,6 +189,10 @@ function isMonospaceColumn(header: string): boolean {
   return lower.includes('atf #') || lower === '#' || lower.includes('timestamp');
 }
 
+function isStanceColumn(header: string): boolean {
+  return header.toLowerCase().includes('stance');
+}
+
 function MarkdownAnalysisRenderer({ markdown }: { markdown: string }) {
   const blocks = useMemo(() => parseMarkdownBlocks(markdown), [markdown]);
 
@@ -221,7 +225,9 @@ function MarkdownAnalysisRenderer({ markdown }: { markdown: string }) {
                       <th
                         key={`th_${hIdx}`}
                         className={`px-3.5 py-2.5 text-xs font-semibold uppercase tracking-wide text-[#475569] ${
-                          isMonospaceColumn(header) ? 'whitespace-nowrap' : ''
+                          isMonospaceColumn(header) || isStanceColumn(header)
+                            ? 'whitespace-nowrap'
+                            : ''
                         }`}
                       >
                         {header}
@@ -238,13 +244,16 @@ function MarkdownAnalysisRenderer({ markdown }: { markdown: string }) {
                       {block.headers.map((header, cIdx) => {
                         const cell = row[cIdx] ?? '';
                         const mono = isMonospaceColumn(header);
+                        const stance = isStanceColumn(header);
                         return (
                           <td
                             key={`td_${cIdx}`}
                             className={`align-top px-3.5 py-2.5 leading-relaxed ${
                               mono
                                 ? 'whitespace-nowrap font-mono text-xs tabular-nums text-[#0F172A]'
-                                : 'text-sm text-[#1E293B]'
+                                : stance
+                                  ? 'whitespace-nowrap text-xs font-medium text-[#0F172A]'
+                                  : 'text-sm text-[#1E293B]'
                             }`}
                           >
                             {renderInlineFormatting(cell)}

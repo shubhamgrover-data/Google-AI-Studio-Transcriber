@@ -3413,7 +3413,7 @@ async function startServer() {
 1. A timestamped video/livestream transcript (which may be in Hindi, Hinglish, or English with speech-to-text typos).
 2. A reference image listing the "ATF Top 60 Stocks" with their serial numbers (#1–#60).
 
-Your task is to cross-reference EVERY stock mentioned in the transcript against EVERY stock in the ATF Top 60 image and produce a strictly structured output.
+Your task is to cross-reference EVERY stock and ETF mentioned in the transcript against EVERY stock in the ATF Top 60 image and produce a strictly structured output.
 
 ### Step-by-Step Rules (Follow Strictly)
 
@@ -3421,30 +3421,38 @@ Your task is to cross-reference EVERY stock mentioned in the transcript against 
 - First extract all 60 numbered stocks from the ATF Top 60 image exactly as listed (preserve the image's serial numbers, including any duplicate or skipped numbering quirks).
 
 2. Decode Speech-to-Text (ASR) Errors Carefully:
-- Transcripts may contain phonetic Hindi/English typos for Indian stock names (e.g., "मन्नापूरम फनांस" = Manappuram Finance, "टीएमपीवी" = Tata Motors Passenger Vehicles, "एसडीएफसी" = HDFC Bank, "वोटर फोन / वीआई" = Vodafone Idea, "NSC" = NSE, "आये अरेफ से" = IRFC).
-- Normalize clear phonetic matches to the official company name.
-- If a stock name is garbled and cannot be identified with certainty, keep it verbatim and append *(as transcribed)*. Never guess or invent a company name.
+- Transcripts may contain phonetic Hindi/English typos for Indian or international stock/ETF names (e.g., "मन्नापूरम फनांस" = Manappuram Finance, "टीएमपीवी" = Tata Motors Passenger Vehicles, "एसडीएफसी" = HDFC Bank, "वोटर फोन / वीआई" = Vodafone Idea, "NSC" = NSE, "आये अरेफ से" = IRFC, "एनवीडिया" = NVIDIA, "क्यूक्यूक्यू" = QQQ, "गोल्ड बीज़" = Gold BeES).
+- Normalize clear phonetic matches to the official company or ETF name.
+- If a stock or ETF name is garbled and cannot be identified with certainty, keep it verbatim and append *(as transcribed)*. Never guess or invent a company or ETF name.
 
-3. Apply Strict "Strong Buy" Classification Criteria:
-- Include a stock in Tables 1 or 2 ONLY if the speaker gives an emphatic bullish call, such as:
-- "बहुत अच्छा है" / "बहुत बहुत अच्छा है" (very good)
-- "भर-भर के खरीदो" / "खूब खरीदो" / "लगातार खरीदो" (buy heavily / continuously)
-- "हर फ्राइडे खरीदो" (buy every Friday / 26 months)
-- Explicit "a steal", "#1 stock", or strong multi-bagger / 2x–3x / specific upside target call (including high-conviction swing trades).
-- Do NOT include in Tables 1 or 2:
-- Stocks only called plain "अच्छा है" / "ठीक है" (mild buy/good) without strong conviction or buying frequency.
-- Stocks marked "too expensive / wait", "hold only", "book profit / exit", "avoid", or "sell".
-- Stocks mentioned only in passing as sector/FII allocation examples with no direct buy recommendation.
-- Commodities or ETFs (e.g., Gold, Silver, Gold BeES) — exclude them from the stock tables.
+3. Table 1 Criteria (IN ATF Top 60 — Strict "Strong Buy" Only):
+- Include an ATF Top 60 stock in Table 1 ONLY if the speaker gives an emphatic bullish call, such as:
+  - "बहुत अच्छा है" / "बहुत बहुत अच्छा है" (very good)
+  - "भर-भर के खरीदो" / "खूब खरीदो" / "लगातार खरीदो" (buy heavily / continuously)
+  - "हर फ्राइडे खरीदो" (buy every Friday / 26 months)
+  - Explicit "a steal", "#1 stock", or strong multi-bagger / 2x–3x / specific upside target call (including high-conviction swing trades).
+- Do NOT include in Table 1:
+  - ATF 60 stocks only called plain "अच्छा है" / "ठीक है" (mild buy/good) without strong conviction or buying frequency.
+  - ATF 60 stocks marked "too expensive / wait", "hold only", "book profit / exit", "avoid", or "sell".
+  - ATF 60 stocks mentioned only in passing as sector/FII allocation examples with no direct buy recommendation.
+  - Report all such non-Strong-Buy ATF 60 mentions in the *Note on other ATF 60 stocks discussed in the transcript* paragraph below Table 1.
+- If zero ATF Top 60 stocks qualify as Strong Buy, output a single \`None\` row in Table 1.
 
-4. Capture Exact Levels, Targets, Timestamps & Conflicts:
-- List every timestamp where the stock is discussed (e.g., 04:06, 43:57).
-- Extract exact entry prices, dip levels, exit/target prices, holding horizons, and buying cadence (e.g., "all 4 Fridays/month", "1 Friday/month", "3-month swing trade").
-- If no price level is mentioned, explicitly write No price level given.
+4. Table 2 Criteria (OUTSIDE ATF Top 60 — ALL Discussed Stocks & ETFs):
+- Unlike Table 1, Table 2 must include **EVERY** individual stock (Indian or international/US, e.g., NVIDIA, Apple, Microsoft) AND **EVERY** ETF, index fund, or tracked index/commodity ETF (e.g., S&P 500, QQQ, Nifty 50 / Nifty BeES, Nasdaq 100, Gold / Gold BeES, Silver ETF, sectoral ETFs) discussed anywhere in the transcript that is NOT in the ATF Top 60 image.
+- Include them **even if the video is unrelated to ATF Top 60**, **even if the speaker did NOT give a strict "Strong Buy" call**, and **even if no price levels were stated** (including moderate buys, broad bullish/allocation views, swing trades, hold/wait, avoid/sell, valuation or accounting discussions, and passing mentions).
+- Order rows in Table 2 with **Strong Buy / Bullish / Swing Trade** calls first, followed by other stances (**Mild Buy**, **Hold / Wait**, **Avoid / Sell**, **Discussed / Mentioned**).
+- Fill the \`Stance\` column accurately for each row (e.g., \`Strong Buy\`, \`Bullish / Accumulate\`, \`Swing Trade\`, \`Mild Buy\`, \`Hold / Wait\`, \`Avoid / Sell\`, \`Discussed / Mentioned\`).
+- Output \`None\` in Table 2 **ONLY** if the video/transcript is completely unrelated to stocks, ETFs, indices, or equity/commodity investing (i.e., zero stocks or ETFs outside ATF Top 60 are discussed at all).
+
+5. Capture Exact Levels, Targets, Timestamps & Conflicts:
+- List every timestamp where the stock or ETF is discussed (e.g., 04:06, 43:57).
+- Extract exact entry prices, dip levels, exit/target prices, holding horizons, buying cadence (e.g., "all 4 Fridays/month", "1 Friday/month", "3-month swing trade"), and concise key speaker commentary (e.g., macro allocation, valuation, or risk notes).
+- If no price level is mentioned, explicitly write \`No price level given\` alongside the speaker's actual commentary.
 - If the speaker gives different targets at different timestamps, report both with their timestamps—do not pick one.
 - Do not add external market prices, live quotes, or your own financial advice.
 
-5. Mandatory Count Verification (Do Silently Before Outputting):
+6. Mandatory Count Verification (Do Silently Before Outputting):
 - Verify that: (ATF 60 stocks discussed in transcript—whether Strong Buy or not) + (ATF 60 stocks NOT discussed in transcript) = Total stocks in the ATF Top 60 image.
 - Do not miss any stock from the image.
 
@@ -3458,13 +3466,13 @@ Output ONLY the following 3 sections in exact Markdown table format:
 | :--- | :--- | :--- | :--- |
 | [Number from image] | [Company Name] | [MM:SS] | [Exact entry/target levels, horizon, buying frequency, and key speaker notes] |
 
-*Note on other ATF 60 stocks discussed in the transcript (not called "strong buy"):* [One concise paragraph listing every other ATF 60 stock mentioned in the transcript with its ATF # and the speaker's actual stance—especially flagging any stock on the ATF 60 list that the speaker called "wait", "avoid", or "sell", or only mentioned in passing.]
+*Note on other ATF 60 stocks discussed in the transcript (not called "strong buy"):* [One concise paragraph listing every other ATF 60 stock mentioned in the transcript with its ATF # and the speaker's actual stance—especially flagging any stock on the ATF 60 list that the speaker called "wait", "avoid", or "sell", or only mentioned in passing. If none of the ATF Top 60 stocks were discussed, state that clearly.]
 
-### 2. Strong Buy Stocks — OUTSIDE ATF Top 60
+### 2. Stocks & ETFs Discussed — OUTSIDE ATF Top 60
 
-| Stock | Timestamp | Levels, Targets & Buying Guidance |
-| :--- | :--- | :--- |
-| [Company Name] | [MM:SS] | [Exact entry/target levels, horizon, buying frequency, and key speaker notes] |
+| Stock / ETF | Stance | Timestamp | Levels, Targets & Buying Guidance |
+| :--- | :--- | :--- | :--- |
+| [Company or ETF Name] | [Strong Buy / Bullish / Swing Trade / Mild Buy / Hold / Wait / Avoid / Sell / Discussed] | [MM:SS] | [Exact entry/target levels, horizon, buying frequency, and key speaker notes; write "No price level given" if none stated] |
 
 ### 3. Stocks in ATF Top 60 — NOT Discussed in the Transcript ([Count] Stocks)
 
@@ -4115,7 +4123,8 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
    - If the same stock appears in multiple analysis.md files within the same category, merge it into ONE consolidated entry (normalize minor spelling/case differences to the official company name).
    - If a stock is explicitly recommended as BOTH a long-term Strong Buy AND a separate Swing Trade setup across the files, include it in both arrays with the respective levels/notes clearly scoped to each category.
 2. Exclude Non-Buys:
-   - Do NOT include stocks whose stance across the files is strictly "avoid", "sell", "too expensive / wait", or "hold only".
+   - Note that Section 2 ("OUTSIDE ATF Top 60") in analysis.md can list ALL discussed outside-ATF stocks & ETFs along with their Stance. ONLY promote an item from Section 2 into "strongBuys" or "swingTrades" if its stance is an actionable Strong Buy, Bullish/Accumulate, or Swing Trade recommendation.
+   - Do NOT include stocks or ETFs whose stance across the files is strictly "avoid", "sell", "too expensive / wait", "hold only", or "discussed / mentioned in passing" without a buy recommendation.
    - If one video recommends a stock as a Strong Buy while another video warns "wait / expensive / book profit", keep the stock if strongly recommended, set "hasLevelConflict": true, and explicitly cite the caution under that source ID.
 3. Preserve Exact Levels & Never Fabricate:
    - Extract exact entry prices, dip zones, targets, upside multiples, stop-losses, holding horizons, and buying cadences directly from the attached files.
@@ -4942,6 +4951,23 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
         }
       })();
     });
+  });
+
+  app.get('/plans/:filename', (req: Request, res: Response) => {
+    const fileName = String(req.params.filename || '').trim();
+    if (!/^[a-zA-Z0-9._-]+\.md$/.test(fileName)) {
+      res.status(400).json({ ok: false, message: 'Invalid plan filename.' });
+      return;
+    }
+    const plansDir = path.resolve(__dirname, 'plans');
+    const resolvedPath = path.resolve(plansDir, fileName);
+    if (!resolvedPath.startsWith(plansDir + path.sep) || !existsSync(resolvedPath)) {
+      res.status(404).json({ ok: false, message: 'Plan document not found.' });
+      return;
+    }
+    res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    createReadStream(resolvedPath).pipe(res);
   });
 
   if (process.env.NODE_ENV === 'production') {
