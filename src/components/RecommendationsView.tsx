@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  Bot,
   Check,
   ChevronDown,
   ChevronUp,
@@ -16,12 +17,17 @@ import {
   TrendingUp,
   X,
 } from 'lucide-react';
+import type { AskAiContext } from '../types/askAi';
 import type {
   RecommendationEntry,
   RecommendationPollResponse,
   RecommendationSnapshot,
   TranscriptJob,
 } from '../types/transcript';
+import {
+  buildLatestRecommendationsAskAiContext,
+  buildSelectedAnalysesAskAiContext,
+} from '../utils/askAiContexts';
 import {
   formatLocalRecommendationTimestamp,
   getSourceShortLabel,
@@ -48,6 +54,7 @@ interface RecommendationsViewProps {
   onRefreshLatestFromDrive: () => Promise<void>;
   onOpenDriveSetup: () => void;
   onGoToAnalysis: () => void;
+  onOpenAskAi: (context: AskAiContext) => void;
 }
 
 type AtfFilter = 'all' | 'atf' | 'outside';
@@ -217,6 +224,7 @@ export function RecommendationsView({
   onRefreshLatestFromDrive,
   onOpenDriveSetup,
   onGoToAnalysis,
+  onOpenAskAi,
 }: RecommendationsViewProps) {
   const analyzedJobs = useMemo(
     () => jobs.filter((j) => Boolean(j.analysis?.markdown?.trim())),
@@ -519,7 +527,7 @@ export function RecommendationsView({
             </span>
           </button>
 
-          <div className="flex shrink-0 items-center gap-3">
+          <div className="flex shrink-0 flex-wrap items-center gap-2.5">
             {isSourcesExpanded && analyzedJobs.length > 0 && (
               <div className="flex items-center gap-2 text-xs">
                 <button
@@ -544,10 +552,28 @@ export function RecommendationsView({
 
             <button
               type="button"
+              disabled={selectedJobs.length === 0}
+              onClick={() => {
+                const ctx = buildSelectedAnalysesAskAiContext(selectedJobs);
+                if (ctx) onOpenAskAi(ctx);
+              }}
+              title={
+                selectedJobs.length === 0
+                  ? 'Select at least one analyzed source file to ask AI'
+                  : `Chat with ${selectedJobs.length} selected analyzed ${selectedJobs.length === 1 ? 'file' : 'files'}`
+              }
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#0F172A] px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-[#1E293B] disabled:cursor-not-allowed disabled:bg-[#CBD5E1] disabled:text-[#64748B] cursor-pointer"
+            >
+              <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+              Ask AI{selectedJobs.length > 0 ? ` (${selectedJobs.length})` : ''}
+            </button>
+
+            <button
+              type="button"
               aria-expanded={isSourcesExpanded}
               aria-controls="analyzed-sources-panel"
               onClick={() => setIsSourcesExpanded((v) => !v)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1 text-xs font-medium text-[#334155] transition-colors hover:border-[#94A3B8] hover:text-[#0F172A] cursor-pointer"
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-2.5 py-1 text-xs font-medium text-[#334155] transition-colors hover:border-[#94A3B8] hover:text-[#0F172A] cursor-pointer"
             >
               {isSourcesExpanded ? (
                 <>
@@ -997,6 +1023,17 @@ export function RecommendationsView({
                     >
                       <Download className="h-3.5 w-3.5" aria-hidden="true" />
                       Download .md
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onOpenAskAi(buildLatestRecommendationsAskAiContext(latestRecommendation))
+                      }
+                      className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[#BE123C] cursor-pointer"
+                    >
+                      <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+                      Chat with recommendations
                     </button>
                   </div>
                 </div>

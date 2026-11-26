@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { HardDrive } from 'lucide-react';
+import { AskAiWidget } from './components/AskAiWidget';
 import { DriveSetupModal } from './components/DriveSetupModal';
 import { GenAiAnalysisView } from './components/GenAiAnalysisView';
 import { IngestPanel } from './components/IngestPanel';
 import { RecommendationsView } from './components/RecommendationsView';
 import { StudioWorkspace } from './components/StudioWorkspace';
 import { TopNav } from './components/TopNav';
+import type { AskAiContext } from './types/askAi';
 import type {
   AppView,
   AsyncJobPollResponse,
@@ -118,6 +120,15 @@ export default function App() {
   const [refreshDetail, setRefreshDetail] = useState('');
   const [refreshProgressPct, setRefreshProgressPct] = useState(0);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+
+  // Shared reusable Ask AI floating widget state (same chatbot across all tabs, only fed data changes)
+  const [isAskAiOpen, setIsAskAiOpen] = useState(false);
+  const [askAiContext, setAskAiContext] = useState<AskAiContext | null>(null);
+
+  const handleOpenAskAi = useCallback((context: AskAiContext) => {
+    setAskAiContext(context);
+    setIsAskAiOpen(true);
+  }, []);
 
   const pollCancelledRef = useRef(false);
 
@@ -810,6 +821,7 @@ export default function App() {
                 onDismissRefreshError={() => setRefreshError(null)}
                 driveEnabled={driveEnabled}
                 driveSessionToken={driveSessionToken}
+                onOpenAskAi={handleOpenAskAi}
               />
             )}
           </div>
@@ -823,6 +835,7 @@ export default function App() {
             onSyncJobToDrive={handleSyncJobToDrive}
             driveEnabled={driveEnabled}
             onGoToStudio={() => setActiveView('studio')}
+            onOpenAskAi={handleOpenAskAi}
           />
         )}
 
@@ -839,6 +852,7 @@ export default function App() {
             onRefreshLatestFromDrive={() => fetchLatestRecommendationFromDrive()}
             onOpenDriveSetup={() => setIsSetupModalOpen(true)}
             onGoToAnalysis={() => setActiveView('analysis')}
+            onOpenAskAi={handleOpenAskAi}
           />
         )}
       </main>
@@ -849,6 +863,12 @@ export default function App() {
         driveStatus={driveStatus}
         onVerifyConnection={() => fetchDriveStatusAndLibrary()}
         isVerifying={isVerifyingDrive}
+      />
+
+      <AskAiWidget
+        isOpen={isAskAiOpen}
+        context={askAiContext}
+        onClose={() => setIsAskAiOpen(false)}
       />
     </div>
   );

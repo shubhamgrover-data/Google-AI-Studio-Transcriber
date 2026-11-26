@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bot,
   Check,
   Clock,
   Copy,
@@ -14,7 +15,9 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import type { AskAiContext } from '../types/askAi';
 import type { RefreshMode, TranscriptJob } from '../types/transcript';
+import { buildStudioTranscriptAskAiContext } from '../utils/askAiContexts';
 import { ConfirmDeleteModal } from './ConfirmDeleteModal';
 import {
   formatDisplayTimestamp,
@@ -40,6 +43,7 @@ interface StudioWorkspaceProps {
   onDismissRefreshError?: () => void;
   driveEnabled: boolean;
   driveSessionToken: string | null;
+  onOpenAskAi: (context: AskAiContext) => void;
 }
 
 const PLATFORM_LABELS: Record<TranscriptJob['sourceType'], string> = {
@@ -62,6 +66,7 @@ export function StudioWorkspace({
   onDismissRefreshError,
   driveEnabled,
   driveSessionToken,
+  onOpenAskAi,
 }: StudioWorkspaceProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSpeaker, setSelectedSpeaker] = useState<string>('ALL');
@@ -398,6 +403,15 @@ export function StudioWorkspace({
                   Copy
                 </>
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onOpenAskAi(buildStudioTranscriptAskAiContext(job))}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-[#BE123C] cursor-pointer"
+            >
+              <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+              Chat with transcript
             </button>
 
             {/* Reload Icon Button to Refresh Cached / Existing Transcript */}

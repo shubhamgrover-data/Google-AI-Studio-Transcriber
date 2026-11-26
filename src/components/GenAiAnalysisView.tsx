@@ -1,24 +1,30 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ChangeEvent, ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { ChangeEvent } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  Bot,
   Check,
+  ChevronRight,
   Copy,
   Download,
   FileText,
   HardDrive,
   Image as ImageIcon,
   Loader2,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Sparkles,
   Upload,
 } from 'lucide-react';
+import type { AskAiContext } from '../types/askAi';
 import type {
   AnalysisPollResponse,
   TranscriptAnalysisResult,
   TranscriptJob,
 } from '../types/transcript';
+import { buildSingleAnalysisAskAiContext } from '../utils/askAiContexts';
 import {
   formatDisplayTimestamp,
   serializeToTXT,
@@ -26,6 +32,7 @@ import {
   triggerFileDownload,
   truncateTitle,
 } from '../utils/exporters';
+import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface GenAiAnalysisViewProps {
   jobs: TranscriptJob[];
@@ -34,6 +41,7 @@ interface GenAiAnalysisViewProps {
   onSyncJobToDrive?: (jobId: string) => Promise<boolean>;
   driveEnabled?: boolean;
   onGoToStudio: () => void;
+  onOpenAskAi: (context: AskAiContext) => void;
 }
 
 interface ReferenceStatus {
@@ -43,256 +51,6 @@ interface ReferenceStatus {
   publicUrl?: string;
 }
 
-type MarkdownBlock =
-  | { type: 'heading'; level: number; text: string }
-  | { type: 'table'; headers: string[]; rows: string[][] }
-  | { type: 'list'; items: string[] }
-  | { type: 'paragraph'; text: string };
-
-function splitTableRow(line: string): string[] {
-  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
-  return trimmed.split('|').map((cell) => cell.trim());
-}
-
-function isTableSeparatorLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed.includes('|') || !trimmed.includes('-')) return false;
-  const cells = splitTableRow(trimmed);
-  return cells.length > 0 && cells.every((c) => /^:?-{2,}:?$/.test(c));
-}
-
-function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
-  const blocks: MarkdownBlock[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const rawLine = lines[i];
-    const trimmed = rawLine.trim();
-
-    if (!trimmed) {
-      i += 1;
-      continue;
-    }
-
-    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
-    if (headingMatch) {
-      blocks.push({
-        type: 'heading',
-        level: headingMatch[1].length,
-        text: headingMatch[2].trim(),
-      });
-      i += 1;
-      continue;
-    }
-
-    if (
-      trimmed.includes('|') &&
-      i + 1 < lines.length &&
-      isTableSeparatorLine(lines[i + 1])
-    ) {
-      const headers = splitTableRow(trimmed);
-      i += 2;
-      const rows: string[][] = [];
-      while (i < lines.length) {
-        const rowLine = lines[i].trim();
-        if (!rowLine || !rowLine.includes('|')) break;
-        if (isTableSeparatorLine(rowLine)) {
-          i += 1;
-          continue;
-        }
-        rows.push(splitTableRow(rowLine));
-        i += 1;
-      }
-      blocks.push({ type: 'table', headers, rows });
-      continue;
-    }
-
-    if (/^[-*]\s+/.test(trimmed)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
-        items.push(lines[i].trim().replace(/^[-*]\s+/, ''));
-        i += 1;
-      }
-      blocks.push({ type: 'list', items });
-      continue;
-    }
-
-    const paraLines: string[] = [];
-    while (i < lines.length) {
-      const cur = lines[i].trim();
-      if (
-        !cur ||
-        /^#{1,4}\s+/.test(cur) ||
-        /^[-*]\s+/.test(cur) ||
-        (cur.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1]))
-      ) {
-        break;
-      }
-      paraLines.push(cur);
-      i += 1;
-    }
-    if (paraLines.length > 0) {
-      blocks.push({ type: 'paragraph', text: paraLines.join(' ') });
-    }
-  }
-
-  return blocks;
-}
-
-function renderInlineFormatting(text: string): ReactNode[] {
-  const tokens: ReactNode[] = [];
-  const regex = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let keyIdx = 0;
-
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      tokens.push(text.slice(lastIndex, match.index));
-    }
-    const token = match[0];
-    if (token.startsWith('**') && token.endsWith('**')) {
-      tokens.push(
-        <strong key={`b_${keyIdx++}`} className="font-semibold text-[#0F172A]">
-          {token.slice(2, -2)}
-        </strong>
-      );
-    } else if (token.startsWith('*') && token.endsWith('*')) {
-      tokens.push(
-        <em key={`i_${keyIdx++}`} className="italic text-[#334155]">
-          {token.slice(1, -1)}
-        </em>
-      );
-    } else if (token.startsWith('`') && token.endsWith('`')) {
-      tokens.push(
-        <code
-          key={`c_${keyIdx++}`}
-          className="rounded bg-[#F1F5F9] px-1.5 py-0.5 font-mono text-xs text-[#0F172A]"
-        >
-          {token.slice(1, -1)}
-        </code>
-      );
-    }
-    lastIndex = match.index + token.length;
-  }
-
-  if (lastIndex < text.length) {
-    tokens.push(text.slice(lastIndex));
-  }
-
-  return tokens;
-}
-
-function isMonospaceColumn(header: string): boolean {
-  const lower = header.toLowerCase();
-  return lower.includes('atf #') || lower === '#' || lower.includes('timestamp');
-}
-
-function isStanceColumn(header: string): boolean {
-  return header.toLowerCase().includes('stance');
-}
-
-function MarkdownAnalysisRenderer({ markdown }: { markdown: string }) {
-  const blocks = useMemo(() => parseMarkdownBlocks(markdown), [markdown]);
-
-  return (
-    <div className="space-y-5">
-      {blocks.map((block, idx) => {
-        if (block.type === 'heading') {
-          return (
-            <h3
-              key={`h_${idx}`}
-              className={`font-semibold tracking-tight text-[#0F172A] ${
-                block.level <= 2 ? 'pt-2 text-lg' : 'pt-1 text-base'
-              }`}
-            >
-              {renderInlineFormatting(block.text)}
-            </h3>
-          );
-        }
-
-        if (block.type === 'table') {
-          return (
-            <div
-              key={`t_${idx}`}
-              className="overflow-x-auto rounded-lg border border-[#E2E8F0] bg-white"
-            >
-              <table className="w-full min-w-[540px] border-collapse text-left text-sm">
-                <thead>
-                  <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC]">
-                    {block.headers.map((header, hIdx) => (
-                      <th
-                        key={`th_${hIdx}`}
-                        className={`px-3.5 py-2.5 text-xs font-semibold uppercase tracking-wide text-[#475569] ${
-                          isMonospaceColumn(header) || isStanceColumn(header)
-                            ? 'whitespace-nowrap'
-                            : ''
-                        }`}
-                      >
-                        {header}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#E2E8F0]">
-                  {block.rows.map((row, rIdx) => (
-                    <tr
-                      key={`tr_${rIdx}`}
-                      className="transition-colors hover:bg-[#F8FAFC]"
-                    >
-                      {block.headers.map((header, cIdx) => {
-                        const cell = row[cIdx] ?? '';
-                        const mono = isMonospaceColumn(header);
-                        const stance = isStanceColumn(header);
-                        return (
-                          <td
-                            key={`td_${cIdx}`}
-                            className={`align-top px-3.5 py-2.5 leading-relaxed ${
-                              mono
-                                ? 'whitespace-nowrap font-mono text-xs tabular-nums text-[#0F172A]'
-                                : stance
-                                  ? 'whitespace-nowrap text-xs font-medium text-[#0F172A]'
-                                  : 'text-sm text-[#1E293B]'
-                            }`}
-                          >
-                            {renderInlineFormatting(cell)}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          );
-        }
-
-        if (block.type === 'list') {
-          return (
-            <ul key={`l_${idx}`} className="list-disc space-y-1.5 pl-5 text-sm text-[#334155]">
-              {block.items.map((item, iIdx) => (
-                <li key={`li_${iIdx}`} className="leading-relaxed">
-                  {renderInlineFormatting(item)}
-                </li>
-              ))}
-            </ul>
-          );
-        }
-
-        return (
-          <p
-            key={`p_${idx}`}
-            className="rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-3 text-sm leading-relaxed text-[#334155]"
-          >
-            {renderInlineFormatting(block.text)}
-          </p>
-        );
-      })}
-    </div>
-  );
-}
-
 export function GenAiAnalysisView({
   jobs,
   initialSelectedJobId,
@@ -300,10 +58,13 @@ export function GenAiAnalysisView({
   onSyncJobToDrive,
   driveEnabled = false,
   onGoToStudio,
+  onOpenAskAi,
 }: GenAiAnalysisViewProps) {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(
     () => initialSelectedJobId || jobs[0]?.id || null
   );
+  // Collapsible left-side Recent Transcriptions rail (collapsed by default)
+  const [isRecentExpanded, setIsRecentExpanded] = useState(false);
   const [referenceStatus, setReferenceStatus] = useState<ReferenceStatus>({
     loading: true,
     available: false,
@@ -557,71 +318,116 @@ export function GenAiAnalysisView({
         )}
       </section>
 
-      {/* Split Workspace: Recent Transcriptions + Analysis Output */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Left: Recent Transcriptions List */}
-        <aside className="lg:col-span-4">
-          <div className="rounded-xl border border-[#E2E8F0] bg-white p-4">
-            <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-3">
-              <h2 className="text-sm font-semibold text-[#0F172A]">
-                Recent Transcriptions
-              </h2>
-              <span className="font-mono text-xs tabular-nums text-[#64748B]">
-                {jobs.length} {jobs.length === 1 ? 'item' : 'items'}
-              </span>
-            </div>
+      {/* Split Workspace: Collapsible Left-Side Recent Transcriptions Rail + Analysis Output */}
+      <div className="flex flex-col items-start gap-5 lg:flex-row">
+        {/* Left: Collapsible/Expandable Side Panel (Collapsed by Default) */}
+        <aside
+          aria-label="Recent transcriptions sidebar"
+          className={`shrink-0 ${isRecentExpanded ? 'w-full lg:w-[320px]' : 'w-full lg:w-[54px]'}`}
+        >
+          {isRecentExpanded ? (
+            <div className="rounded-xl border border-[#E2E8F0] bg-white p-4">
+              <div className="flex items-center justify-between gap-2 border-b border-[#E2E8F0] pb-3">
+                <div className="flex min-w-0 items-baseline gap-2">
+                  <h2 className="truncate text-sm font-semibold text-[#0F172A]">
+                    Recent Transcriptions
+                  </h2>
+                  <span className="shrink-0 font-mono text-xs tabular-nums text-[#64748B]">
+                    {jobs.length}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsRecentExpanded(false)}
+                  aria-expanded={true}
+                  title="Collapse Recent Transcriptions"
+                  aria-label="Collapse Recent Transcriptions"
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] text-[#475569] transition-colors hover:border-[#0F172A] hover:text-[#0F172A] cursor-pointer"
+                >
+                  <PanelLeftClose className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+              </div>
 
-            <div className="mt-3 space-y-2">
-              {jobs.map((job) => {
-                const isSelected = job.id === selectedJob?.id;
-                const isRunningThis = analyzingJobId === job.id;
-                return (
-                  <button
-                    key={job.id}
-                    type="button"
-                    title={job.title}
-                    onClick={() => {
-                      setSelectedJobId(job.id);
-                      setErrorMessage(null);
-                    }}
-                    className={`w-full rounded-lg border p-3.5 text-left transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'border-[#0F172A] bg-[#F8FAFC]'
-                        : 'border-[#E2E8F0] bg-white hover:border-[#94A3B8]'
-                    }`}
-                  >
-                    <p className="truncate text-sm font-medium text-[#0F172A]">
-                      {truncateTitle(job.title, 50)}
-                    </p>
-                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                      <span className="font-mono tabular-nums text-[#64748B]">
-                        {job.language} · {formatDisplayTimestamp(job.durationSeconds)} · {job.segments.length} segs
-                      </span>
-                      <span
-                        className={
-                          isRunningThis
-                            ? 'font-medium text-[#E11D48]'
+              <div className="mt-3 max-h-[680px] space-y-2 overflow-y-auto pr-0.5">
+                {jobs.map((job) => {
+                  const isSelected = job.id === selectedJob?.id;
+                  const isRunningThis = analyzingJobId === job.id;
+                  return (
+                    <button
+                      key={job.id}
+                      type="button"
+                      title={job.title}
+                      onClick={() => {
+                        setSelectedJobId(job.id);
+                        setErrorMessage(null);
+                      }}
+                      className={`w-full rounded-lg border p-3.5 text-left transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'border-[#0F172A] bg-[#F8FAFC]'
+                          : 'border-[#E2E8F0] bg-white hover:border-[#94A3B8]'
+                      }`}
+                    >
+                      <p className="truncate text-sm font-medium text-[#0F172A]">
+                        {truncateTitle(job.title, 44)}
+                      </p>
+                      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <span className="font-mono tabular-nums text-[#64748B]">
+                          {job.language} · {formatDisplayTimestamp(job.durationSeconds)} ·{' '}
+                          {job.segments.length} segs
+                        </span>
+                        <span
+                          className={
+                            isRunningThis
+                              ? 'font-medium text-[#E11D48]'
+                              : job.analysis
+                                ? 'font-medium text-[#15803D]'
+                                : 'text-[#64748B]'
+                          }
+                        >
+                          {isRunningThis
+                            ? 'Analyzing...'
                             : job.analysis
-                              ? 'font-medium text-[#15803D]'
-                              : 'text-[#64748B]'
-                        }
-                      >
-                        {isRunningThis
-                          ? 'Analyzing...'
-                          : job.analysis
-                            ? 'Analyzed'
-                            : 'Ready'}
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
+                              ? 'Analyzed'
+                              : 'Ready'}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setIsRecentExpanded(true)}
+              aria-expanded={false}
+              title={`Expand Recent Transcriptions (${jobs.length})`}
+              aria-label={`Expand Recent Transcriptions (${jobs.length} items)`}
+              className="group flex w-full items-center justify-between rounded-xl border border-[#E2E8F0] bg-white px-4 py-3 text-[#334155] transition-colors hover:border-[#0F172A] hover:text-[#0F172A] lg:h-[320px] lg:flex-col lg:justify-start lg:gap-4 lg:px-2 lg:py-4 cursor-pointer"
+            >
+              <div className="flex items-center gap-2 lg:flex-col lg:gap-2">
+                <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] text-[#0F172A] transition-colors group-hover:border-[#0F172A] group-hover:bg-[#0F172A] group-hover:text-white">
+                  <PanelLeftOpen className="h-4 w-4" aria-hidden="true" />
+                </span>
+                <span className="font-mono text-xs font-semibold tabular-nums text-[#0F172A]">
+                  {jobs.length}
+                </span>
+              </div>
+
+              <span className="text-xs font-semibold tracking-wide text-[#475569] group-hover:text-[#0F172A] lg:[writing-mode:vertical-rl] lg:rotate-180 lg:whitespace-nowrap">
+                Recent Transcriptions
+              </span>
+
+              <ChevronRight
+                className="h-4 w-4 text-[#94A3B8] group-hover:text-[#0F172A] lg:mt-auto"
+                aria-hidden="true"
+              />
+            </button>
+          )}
         </aside>
 
         {/* Right: Selected Transcript Analysis Panel */}
-        <section className="lg:col-span-8">
+        <section className="min-w-0 flex-1 w-full">
           {selectedJob ? (
             <div className="rounded-xl border border-[#E2E8F0] bg-white p-5 sm:p-6">
               <div className="flex flex-col gap-4 border-b border-[#E2E8F0] pb-5 sm:flex-row sm:items-start sm:justify-between">
@@ -713,6 +519,21 @@ export function GenAiAnalysisView({
                     <FileText className="h-3.5 w-3.5" aria-hidden="true" />
                     Transcript .txt
                   </button>
+
+                  {selectedJob.analysis && !isAnalyzingSelected && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const ctx = buildSingleAnalysisAskAiContext(selectedJob);
+                        if (ctx) onOpenAskAi(ctx);
+                      }}
+                      className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg bg-[#0F172A] px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-[#1E293B] cursor-pointer"
+                    >
+                      <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+                      Ask AI
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     disabled={Boolean(analyzingJobId) || !hasReferenceImage}
@@ -844,7 +665,7 @@ export function GenAiAnalysisView({
                   </div>
 
                   {displayMode === 'formatted' ? (
-                    <MarkdownAnalysisRenderer markdown={selectedJob.analysis.markdown} />
+                    <MarkdownRenderer markdown={selectedJob.analysis.markdown} />
                   ) : (
                     <pre className="overflow-x-auto rounded-lg border border-[#E2E8F0] bg-[#F8FAFC] p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap text-[#0F172A]">
                       {selectedJob.analysis.markdown}
