@@ -97,6 +97,7 @@ export default function App() {
   const [showIngestForm, setShowIngestForm] = useState<boolean>(() => loadStoredJobs().length === 0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStep, setProcessingStep] = useState(0);
+  const [skippedSteps, setSkippedSteps] = useState<number[]>([]);
   const [processingDetail, setProcessingDetail] = useState('');
   const [progressPct, setProgressPct] = useState(0);
   const [errorState, setErrorState] = useState<TranscribeApiError | null>(null);
@@ -302,6 +303,7 @@ export default function App() {
         setRefreshProgressPct(statusPayload.progressPct);
       } else {
         setProcessingStep(statusPayload.stepIndex);
+        setSkippedSteps(Array.isArray(statusPayload.skippedSteps) ? statusPayload.skippedSteps : []);
         setProcessingDetail(statusPayload.stageLabel);
         setProgressPct(statusPayload.progressPct);
       }
@@ -336,6 +338,7 @@ export default function App() {
   async function handleSubmitUrl(url: string) {
     setIsProcessing(true);
     setProcessingStep(0);
+    setSkippedSteps([]);
     setProcessingDetail('Checking Google Drive cache & validating source...');
     setProgressPct(8);
     setErrorState(null);
@@ -448,6 +451,7 @@ export default function App() {
   ) {
     setIsProcessing(true);
     setProcessingStep(0);
+    setSkippedSteps([]);
     setProcessingDetail(`Uploading ${file.name}`);
     setProgressPct(10);
     setErrorState(null);
@@ -728,6 +732,7 @@ export default function App() {
               <IngestPanel
                 isProcessing={isProcessing}
                 processingStep={processingStep}
+                skippedSteps={skippedSteps}
                 processingDetail={processingDetail}
                 progressPct={progressPct}
                 errorState={errorState}

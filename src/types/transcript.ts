@@ -126,6 +126,7 @@ export interface AsyncJobPollResponse {
   asyncJobId: string;
   status: 'queued' | 'processing' | 'completed' | 'failed';
   stepIndex: number;
+  skippedSteps?: number[];
   stageLabel: string;
   progressPct: number;
   job?: Omit<TranscriptJob, 'localMediaUrl'>;

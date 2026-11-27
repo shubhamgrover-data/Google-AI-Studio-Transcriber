@@ -17,6 +17,7 @@ import { detectPlatformFromInput } from '../utils/exporters';
 interface IngestPanelProps {
   isProcessing: boolean;
   processingStep: number;
+  skippedSteps?: number[];
   processingDetail?: string;
   progressPct?: number;
   errorState: TranscribeApiError | null;
@@ -43,6 +44,7 @@ const ACCEPTED_EXTENSIONS = '.mp4,.mov,.webm,.mp3,.wav,.m4a,.ogg,.aac,audio/*,vi
 export function IngestPanel({
   isProcessing,
   processingStep,
+  skippedSteps = [],
   processingDetail,
   progressPct = 0,
   errorState,
@@ -287,7 +289,8 @@ export function IngestPanel({
           </div>
           <ol className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
             {PIPELINE_STEPS.map((label, index) => {
-              const done = index < processingStep;
+              const skipped = skippedSteps.includes(index) && index < processingStep;
+              const done = !skipped && index < processingStep;
               const active = index === processingStep;
               return (
                 <li
@@ -295,15 +298,19 @@ export function IngestPanel({
                   className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs transition-colors ${
                     active
                       ? 'border-[#0F172A] bg-white font-medium text-[#0F172A]'
+                      : skipped
+                      ? 'border-[#FDE68A] bg-[#FFFBEB] text-[#B45309]'
                       : done
                       ? 'border-[#E2E8F0] bg-white text-[#15803D]'
                       : 'border-transparent bg-transparent text-[#64748B]'
                   }`}
                 >
                   <span className="font-mono tabular-nums">
-                    {done ? '✓' : `0${index + 1}`}
+                    {skipped ? '—' : done ? '✓' : `0${index + 1}`}
                   </span>
-                  <span className="truncate">{label}</span>
+                  <span className="truncate">
+                    {skipped ? `${label} (skipped)` : label}
+                  </span>
                 </li>
               );
             })}

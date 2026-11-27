@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -153,7 +153,125 @@ const DIRECT_AUDIO_EXT_TO_MIME: Record<string, string> = {
   '.flac': 'audio/flac',
 };
 
-async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
+interface JsonCookieEntry {
+  name?: string;
+  value?: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  expirationDate?: number;
+  secure?: boolean;
+  partitionKey?: unknown;
+}
+
+function convertJsonCookiesToNetscape(entries: JsonCookieEntry[]): string | null {
+  const lines = ['# Netscape HTTP Cookie File'];
+  let count = 0;
+
+  for (const c of entries) {
+    if (!c || typeof c.name !== 'string' || !c.name.trim() || typeof c.domain !== 'string' || !c.domain.trim()) {
+      continue;
+    }
+    // Skip unrelated third-party partitioned cookies (e.g. bing.com, external embeds)
+    if (typeof c.partitionKey === 'string' && c.partitionKey.trim()) {
+      const pk = c.partitionKey.toLowerCase();
+      if (!pk.includes('youtube.com') && !pk.includes('google.com')) {
+        continue;
+      }
+    }
+    const domain = c.domain.trim();
+    const includeSubdomains = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+    const cookiePath = typeof c.path === 'string' && c.path.trim() ? c.path.trim() : '/';
+    const secure = c.secure ? 'TRUE' : 'FALSE';
+    const rawExpiry =
+      typeof c.expires === 'number'
+        ? c.expires
+        : typeof c.expirationDate === 'number'
+          ? c.expirationDate
+          : 0;
+    const expires = Number.isFinite(rawExpiry) && rawExpiry > 0 ? Math.floor(rawExpiry) : 0;
+    const value = typeof c.value === 'string' ? c.value : '';
+    lines.push([domain, includeSubdomains, cookiePath, secure, String(expires), c.name.trim(), value].join('\t'));
+    count += 1;
+  }
+
+  return count > 0 ? `${lines.join('\n')}\n` : null;
+}
+
+function parseYouTubeCookiesToNetscape(rawInput: string | undefined): string | null {
+  if (!rawInput || !rawInput.trim()) return null;
+  const trimmed = rawInput.trim();
+
+  const tryParseText = (text: string): string | null => {
+    const t = text.trim();
+    if (!t) return null;
+    if (t.startsWith('[') || t.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(t) as unknown;
+        const arr = Array.isArray(parsed)
+          ? (parsed as JsonCookieEntry[])
+          : Array.isArray((parsed as { cookies?: unknown })?.cookies)
+            ? ((parsed as { cookies: JsonCookieEntry[] }).cookies)
+            : null;
+        if (arr) {
+          return convertJsonCookiesToNetscape(arr);
+        }
+      } catch {
+        return null;
+      }
+    }
+    // Netscape cookies.txt format (tab-delimited lines, optional # comments)
+    const nonCommentLines = t
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'));
+    if (nonCommentLines.some((l) => l.split('\t').length >= 7)) {
+      return t.startsWith('# Netscape') ? `${t}\n` : `# Netscape HTTP Cookie File\n${t}\n`;
+    }
+    return null;
+  };
+
+  const direct = tryParseText(trimmed);
+  if (direct) return direct;
+
+  // Fallback: base64-encoded JSON or Netscape cookies.txt
+  try {
+    const decoded = Buffer.from(trimmed, 'base64').toString('utf-8');
+    return tryParseText(decoded);
+  } catch {
+    return null;
+  }
+}
+
+function getYouTubeNetscapeCookies(): string | null {
+  const raw = process.env.YOUTUBE_COOKIES?.trim();
+  if (!raw) return null;
+
+  // Allow YOUTUBE_COOKIES to be either inline content OR a file path (e.g. server/youtube-cookies.json)
+  if (!raw.startsWith('[') && !raw.startsWith('{') && !raw.includes('\n')) {
+    const candidates = path.isAbsolute(raw)
+      ? [raw]
+      : [path.resolve(__dirname, raw), path.resolve(process.cwd(), raw)];
+    for (const candidate of candidates) {
+      try {
+        if (existsSync(candidate) && statSync(candidate).isFile()) {
+          const fileContent = readFileSync(candidate, 'utf-8');
+          const parsed = parseYouTubeCookiesToNetscape(fileContent);
+          if (parsed) return parsed;
+        }
+      } catch {
+        // Fall through to inline parsing
+      }
+    }
+  }
+
+  return parseYouTubeCookiesToNetscape(raw);
+}
+
+async function extractSocialAudioWithYtDlp(
+  targetUrl: string,
+  options?: { useYouTubeCookies?: boolean }
+): Promise<{
   audioPath: string;
   mimeType: string;
   mediaId: string;
@@ -170,9 +288,21 @@ async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
   let rawMediaFile: string | undefined;
 
   try {
+    let cookieFilePath: string | null = null;
+    if (options?.useYouTubeCookies) {
+      const netscapeCookies = getYouTubeNetscapeCookies();
+      if (netscapeCookies) {
+        cookieFilePath = path.join(workDir, 'yt_cookies.txt');
+        await fs.writeFile(cookieFilePath, netscapeCookies, { mode: 0o600 });
+      }
+    }
+
     const ytdlpArgs = [
       '--no-playlist',
       '--no-warnings',
+      '--js-runtimes',
+      'node',
+      ...(cookieFilePath ? ['--cookies', cookieFilePath] : []),
       '--write-info-json',
       '--max-filesize',
       '150M',
@@ -191,7 +321,9 @@ async function extractSocialAudioWithYtDlp(targetUrl: string): Promise<{
 
     const files = await fs.readdir(workDir);
     const infoFile = files.find((f) => f.endsWith('.info.json'));
-    const mediaFile = files.find((f) => !f.endsWith('.info.json') && !f.endsWith('.part'));
+    const mediaFile = files.find(
+      (f) => !f.endsWith('.info.json') && !f.endsWith('.part') && f !== 'yt_cookies.txt'
+    );
 
     if (!mediaFile) {
       throw new Error('yt-dlp did not produce an audio or video file for this link.');
@@ -2369,10 +2501,16 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
+  // Never serve server-side files (such as server/youtube-cookies.json) over HTTP in dev mode
+  app.use('/server', (_req: Request, res: Response) => {
+    res.status(404).end();
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
     const groqConfigured = Boolean(getGroqClient());
     const deepgramConfigured = Boolean(getDeepgramApiKey());
     const geminiConfigured = hasGeminiApiKey();
+    const youtubeCookiesConfigured = Boolean(getYouTubeNetscapeCookies());
     res.json({
       ok: true,
       primaryEngine: groqConfigured
@@ -2387,6 +2525,7 @@ async function startServer() {
       ],
       groqConfigured,
       deepgramConfigured,
+      youtubeCookiesConfigured,
       fallbackModel: GEMINI_MODEL,
     });
   });
@@ -2745,6 +2884,7 @@ async function startServer() {
     asyncJobId: string;
     status: 'queued' | 'processing' | 'completed' | 'failed';
     stepIndex: number;
+    skippedSteps?: number[];
     stageLabel: string;
     progressPct: number;
     createdAt: number;
@@ -2796,6 +2936,7 @@ async function startServer() {
       asyncJobId: rec.asyncJobId,
       status: rec.status,
       stepIndex: rec.stepIndex,
+      skippedSteps: rec.skippedSteps,
       stageLabel: rec.stageLabel,
       progressPct: rec.progressPct,
       job: rec.job,
@@ -2965,9 +3106,13 @@ async function startServer() {
           const deepgramKey = getDeepgramApiKey();
 
           if (groq || deepgramKey) {
+            let ytAudioExtracted = false;
             try {
               updateProgress(1, 'Extracting YouTube audio stream (yt-dlp)...', 24);
-              const extractedYt = await extractSocialAudioWithYtDlp(canonicalUrl);
+              const extractedYt = await extractSocialAudioWithYtDlp(canonicalUrl, {
+                useYouTubeCookies: true,
+              });
+              ytAudioExtracted = true;
               const ytContext = `YouTube Video Title: ${oembed.title || extractedYt.title || 'Unknown'}`;
               let parsed: RawTranscriptPayload | null = null;
               let engineLabel = '';
@@ -3046,11 +3191,22 @@ async function startServer() {
             } catch (ytExtractOrEngineErr) {
               const safeReason =
                 ytExtractOrEngineErr instanceof Error
-                  ? ytExtractOrEngineErr.message.slice(0, 120)
+                  ? ytExtractOrEngineErr.message.slice(0, 140)
                   : 'extraction failed';
               console.warn(`YouTube Groq/Deepgram path fell back to Gemini: ${safeReason}`);
-              updateProgress(2, 'Switching to Google Gemini YouTube final fallback...', 42);
+              if (!ytAudioExtracted) {
+                record.skippedSteps = [1];
+                updateProgress(
+                  2,
+                  'YouTube audio extraction skipped — switching to Google Gemini fallback...',
+                  42
+                );
+              } else {
+                updateProgress(2, 'Switching to Google Gemini YouTube final fallback...', 42);
+              }
             }
+          } else {
+            record.skippedSteps = [1];
           }
 
           const ai = getGeminiClient();
