@@ -4954,7 +4954,7 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
   });
 
   // ---------------------------------------------------------------------------
-  // Reusable Ask AI Streaming Chat Endpoint (OpenAI Primary -> Gemini Fallback)
+  // Reusable Ask AI Async Chat Endpoints (OpenAI-only, stream: false, 300s timeout)
   // ---------------------------------------------------------------------------
   const ASK_AI_MAX_DOC_CHARS = 320_000;
   const ASK_AI_MAX_HISTORY_TURNS = 16;
@@ -4964,6 +4964,19 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
     | 'single_analysis'
     | 'selected_analyses'
     | 'latest_recommendations';
+
+  interface AskAiJobRecord {
+    askAiJobId: string;
+    status: 'processing' | 'completed' | 'failed';
+    stageLabel: string;
+    createdAt: number;
+    reply?: string;
+    engineUsed?: string;
+    error?: string;
+    abortController?: AbortController;
+  }
+
+  const askAiJobs = new Map<string, AskAiJobRecord>();
 
   function buildAskAiSystemInstruction(
     scopeType: AskAiScopeTypeServer,
@@ -4980,6 +4993,9 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
         'You are analyzing the latest consolidated Stock Recommendations report (Strong Buys & Swing Trades). Help the user filter, prioritize, compare levels/targets, inspect flagged conflicts, and trace stocks back to their source videos and timestamps.',
     };
 
+    const shouldStripNotDiscussed =
+      scopeType === 'single_analysis' || scopeType === 'selected_analyses';
+
     const docChunks: string[] = [];
     let usedChars = 0;
     for (let i = 0; i < documents.length; i += 1) {
@@ -4987,10 +5003,13 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
       const header = `\n=== SOURCE ${i + 1}: ${doc.title}${doc.label ? ` (${doc.label})` : ''} ===\n`;
       const remaining = ASK_AI_MAX_DOC_CHARS - usedChars - header.length;
       if (remaining <= 200) break;
+      const preparedContent = shouldStripNotDiscussed
+        ? stripNotDiscussedSection(doc.content)
+        : doc.content;
       const body =
-        doc.content.length > remaining
-          ? `${doc.content.slice(0, remaining)}\n[...truncated for context budget...]`
-          : doc.content;
+        preparedContent.length > remaining
+          ? `${preparedContent.slice(0, remaining)}\n[...truncated for context budget...]`
+          : preparedContent;
       docChunks.push(header + body);
       usedChars += header.length + body.length;
     }
@@ -5003,68 +5022,112 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
       '1. Ground every answer exclusively in the SOURCE DATA provided below. Never fabricate prices, targets, ATF rankings, timestamps, or external news.',
       '2. If a requested detail is absent from the provided sources, state clearly that it was not mentioned in the attached data.',
       '3. Format answers for rapid visual scanning using clean Markdown: concise headings, bullet points with **bold** key labels, and Markdown tables whenever listing or comparing multiple stocks, levels, or videos.',
-      '4. Never wrap your response in <think> tags or meta-commentary; respond directly with the answer.',
+      '4. Keep answers crisp, high-signal, and well-structured without unnecessary repetition unless the user explicitly asks for an exhaustive dump.',
+      '5. Never wrap your response in <think> tags or meta-commentary; respond directly with the answer.',
       '',
       '--- ATTACHED SOURCE DATA ---',
       docChunks.join('\n'),
     ].join('\n');
   }
 
-  function createThinkTagStreamFilter() {
-    let insideThink = false;
-    let pending = '';
+  async function runAskAiWithOpenAiCompat(
+    systemInstruction: string,
+    conversation: Array<{ role: 'user' | 'assistant'; content: string }>,
+    cancelSignal?: AbortSignal
+  ): Promise<string> {
+    const endpoint = `${OPENAI_COMPAT_ANALYSIS_BASE_URL}/chat/completions`;
+    const timeoutSignal = AbortSignal.timeout(300_000);
+    const combinedSignal = cancelSignal
+      ? AbortSignal.any([cancelSignal, timeoutSignal])
+      : timeoutSignal;
 
-    return {
-      push(chunk: string): string {
-        pending += chunk;
-        let out = '';
-
-        while (pending.length > 0) {
-          if (insideThink) {
-            const closeIdx = pending.toLowerCase().indexOf('</think>');
-            if (closeIdx === -1) {
-              // Keep last 8 chars in case </think> is split across chunks
-              if (pending.length > 8) {
-                pending = pending.slice(-8);
-              }
-              break;
-            }
-            pending = pending.slice(closeIdx + 8);
-            insideThink = false;
-          } else {
-            const openIdx = pending.toLowerCase().indexOf('<think>');
-            if (openIdx === -1) {
-              // Keep potential partial "<think" suffix buffered
-              const lastLt = pending.lastIndexOf('<');
-              if (lastLt !== -1 && pending.length - lastLt < 7) {
-                out += pending.slice(0, lastLt);
-                pending = pending.slice(lastLt);
-              } else {
-                out += pending;
-                pending = '';
-              }
-              break;
-            }
-            out += pending.slice(0, openIdx);
-            pending = pending.slice(openIdx + 7);
-            insideThink = true;
+    // Some OpenAI-compatible proxies strip `role: "system"` messages, so embed
+    // the grounding instructions and attached source documents into the first user turn.
+    const openAiMessages = conversation.map((m, idx) =>
+      idx === 0 && m.role === 'user'
+        ? {
+            role: 'user' as const,
+            content: `${systemInstruction}\n\n---\n\n### USER QUESTION:\n${m.content}`,
           }
-        }
-        return out;
+        : m
+    );
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
       },
-      flush(): string {
-        if (insideThink) {
-          pending = '';
-          return '';
-        }
-        const tail = pending;
-        pending = '';
-        return tail;
-      },
+      body: JSON.stringify({
+        model: OPENAI_COMPAT_ANALYSIS_MODEL,
+        stream: false,
+        messages: openAiMessages,
+      }),
+      signal: combinedSignal,
+    });
+
+    const rawBody = await response.text();
+    if (!response.ok) {
+      const compactErr = rawBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+      throw new Error(
+        `OpenAI endpoint error (HTTP ${response.status} ${response.statusText})${compactErr ? `: ${compactErr}` : ''}`
+      );
+    }
+
+    let parsed: {
+      choices?: Array<{ message?: { content?: string | Array<{ text?: string }> | null } }>;
     };
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      throw new Error('OpenAI-compatible endpoint returned a non-JSON response.');
+    }
+
+    const msgContent = parsed.choices?.[0]?.message?.content;
+    const textContent =
+      typeof msgContent === 'string'
+        ? msgContent
+        : Array.isArray(msgContent)
+          ? msgContent.map((part) => part?.text || '').join('\n')
+          : '';
+
+    const cleaned = stripReasoningTags(textContent);
+    if (!cleaned) {
+      throw new Error('OpenAI-compatible endpoint returned an empty response.');
+    }
+    return cleaned;
   }
 
-  app.post('/api/ask-ai/stream', async (req: Request, res: Response) => {
+  app.get('/api/ask-ai/jobs/:jobId', (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId || '').trim();
+    const record = askAiJobs.get(jobId);
+    if (!record) {
+      res.status(404).json({ ok: false, message: 'Ask AI job not found or expired.' });
+      return;
+    }
+    res.json({
+      ok: true,
+      askAiJobId: record.askAiJobId,
+      status: record.status,
+      stageLabel: record.stageLabel,
+      reply: record.reply,
+      engineUsed: record.engineUsed,
+      error: record.error,
+    });
+  });
+
+  app.post('/api/ask-ai/jobs/:jobId/cancel', (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId || '').trim();
+    const record = askAiJobs.get(jobId);
+    if (record && record.status === 'processing') {
+      record.abortController?.abort();
+      record.status = 'failed';
+      record.error = 'Request cancelled.';
+      record.stageLabel = 'Cancelled';
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/ask-ai', (req: Request, res: Response) => {
     const body = req.body as {
       scopeType?: string;
       documents?: Array<{ id?: unknown; title?: unknown; label?: unknown; content?: unknown }>;
@@ -5118,260 +5181,58 @@ Your task is to synthesize ALL provided analysis.md files into two strictly stru
       return;
     }
 
+    const now = Date.now();
+    for (const [id, item] of askAiJobs.entries()) {
+      if (now - item.createdAt > 30 * 60 * 1000) askAiJobs.delete(id);
+    }
+
     const systemInstruction = buildAskAiSystemInstruction(scopeType, documents);
+    const engineLabel = `OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})`;
+    const askAiJobId = `ask_${crypto.randomBytes(8).toString('hex')}`;
+    const abortController = new AbortController();
 
-    // Initialize SSE response
-    res.status(200);
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
+    const record: AskAiJobRecord = {
+      askAiJobId,
+      status: 'processing',
+      stageLabel: `Analyzing context with ${engineLabel}...`,
+      createdAt: now,
+      abortController,
+    };
+    askAiJobs.set(askAiJobId, record);
 
-    let clientDisconnected = false;
-    const upstreamAbort = new AbortController();
-    res.on('close', () => {
-      if (!res.writableEnded) {
-        clientDisconnected = true;
-        upstreamAbort.abort();
-      }
+    res.status(202).json({
+      ok: true,
+      askAiJobId,
+      status: 'processing',
+      stageLabel: record.stageLabel,
     });
 
-    const sendSse = (payload: Record<string, unknown>) => {
-      if (clientDisconnected || res.writableEnded) return;
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    };
-
-    const primaryEngineLabel = `OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL})`;
-    let emittedAnyVisibleText = false;
-
-    // 1. Primary: OpenAI-compatible /chat/completions with stream: true
-    try {
-      const endpoint = `${OPENAI_COMPAT_ANALYSIS_BASE_URL}/chat/completions`;
-      const timeoutSignal = AbortSignal.timeout(90_000);
-      const combinedSignal = AbortSignal.any([upstreamAbort.signal, timeoutSignal]);
-
-      // Some OpenAI-compatible proxies strip `role: "system"` messages, so embed
-      // the grounding instructions and attached source documents into the first user turn.
-      const openAiMessages = conversation.map((m, idx) =>
-        idx === 0 && m.role === 'user'
-          ? {
-              role: 'user' as const,
-              content: `${systemInstruction}\n\n---\n\n### USER QUESTION:\n${m.content}`,
-            }
-          : m
-      );
-
-      const upstreamRes = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream, application/json',
-        },
-        body: JSON.stringify({
-          model: OPENAI_COMPAT_ANALYSIS_MODEL,
-          stream: true,
-          messages: openAiMessages,
-        }),
-        signal: combinedSignal,
-      });
-
-      if (!upstreamRes.ok) {
-        const errBody = (await upstreamRes.text().catch(() => ''))
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 140);
-        throw new Error(
-          `HTTP ${upstreamRes.status} ${upstreamRes.statusText}${errBody ? `: ${errBody}` : ''}`
+    void (async () => {
+      try {
+        const reply = await runAskAiWithOpenAiCompat(
+          systemInstruction,
+          conversation,
+          abortController.signal
         );
+        if (abortController.signal.aborted) return;
+        record.reply = reply;
+        record.engineUsed = engineLabel;
+        record.status = 'completed';
+        record.stageLabel = 'Response ready';
+        record.abortController = undefined;
+      } catch (err) {
+        if (abortController.signal.aborted) return;
+        const message =
+          err instanceof Error && err.message
+            ? err.message
+            : 'OpenAI request failed unexpectedly.';
+        console.warn(`[Ask AI] OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL}) failed:`, message);
+        record.status = 'failed';
+        record.error = message;
+        record.stageLabel = 'Request failed';
+        record.abortController = undefined;
       }
-
-      const contentType = (upstreamRes.headers.get('content-type') || '').toLowerCase();
-      const thinkFilter = createThinkTagStreamFilter();
-
-      if (contentType.includes('application/json')) {
-        // Proxy ignored stream:true and returned a single JSON payload
-        const parsed = (await upstreamRes.json()) as {
-          choices?: Array<{ message?: { content?: string | Array<{ text?: string }> | null } }>;
-        };
-        const msgContent = parsed.choices?.[0]?.message?.content;
-        const rawText =
-          typeof msgContent === 'string'
-            ? msgContent
-            : Array.isArray(msgContent)
-              ? msgContent.map((p) => p?.text || '').join('\n')
-              : '';
-        const cleaned = stripReasoningTags(rawText);
-        if (!cleaned) {
-          throw new Error('OpenAI-compatible endpoint returned an empty response.');
-        }
-        sendSse({ type: 'meta', engineUsed: primaryEngineLabel });
-        sendSse({ type: 'delta', text: cleaned });
-        emittedAnyVisibleText = true;
-      } else if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let lineBuffer = '';
-        let sentMeta = false;
-
-        while (!clientDisconnected) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          lineBuffer += decoder.decode(value, { stream: true });
-
-          const lines = lineBuffer.split(/\r?\n/);
-          lineBuffer = lines.pop() ?? '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith('data:')) continue;
-            const dataPayload = trimmed.slice(5).trim();
-            if (dataPayload === '[DONE]') continue;
-
-            try {
-              const parsed = JSON.parse(dataPayload) as {
-                choices?: Array<{
-                  delta?: { content?: string | null };
-                  message?: { content?: string | null };
-                }>;
-              };
-              const deltaText =
-                parsed.choices?.[0]?.delta?.content ??
-                parsed.choices?.[0]?.message?.content ??
-                '';
-              if (typeof deltaText === 'string' && deltaText.length > 0) {
-                const visible = thinkFilter.push(deltaText);
-                if (visible) {
-                  if (!sentMeta) {
-                    sendSse({ type: 'meta', engineUsed: primaryEngineLabel });
-                    sentMeta = true;
-                  }
-                  emittedAnyVisibleText = true;
-                  sendSse({ type: 'delta', text: visible });
-                }
-              }
-            } catch {
-              // Ignore non-JSON SSE keepalive/comment lines
-            }
-          }
-        }
-
-        const tail = thinkFilter.flush();
-        if (tail && !clientDisconnected) {
-          if (!sentMeta) {
-            sendSse({ type: 'meta', engineUsed: primaryEngineLabel });
-          }
-          emittedAnyVisibleText = true;
-          sendSse({ type: 'delta', text: tail });
-        }
-
-        if (!emittedAnyVisibleText && !clientDisconnected) {
-          throw new Error('OpenAI-compatible stream finished without emitting any text.');
-        }
-      } else {
-        throw new Error('OpenAI-compatible response had no readable stream body.');
-      }
-
-      if (!clientDisconnected) {
-        sendSse({ type: 'done', engineUsed: primaryEngineLabel });
-        res.end();
-      }
-      return;
-    } catch (openAiErr) {
-      if (clientDisconnected) {
-        if (!res.writableEnded) res.end();
-        return;
-      }
-      if (emittedAnyVisibleText) {
-        sendSse({
-          type: 'error',
-          message:
-            openAiErr instanceof Error
-              ? `Stream interrupted: ${openAiErr.message}`
-              : 'Stream interrupted unexpectedly.',
-        });
-        res.end();
-        return;
-      }
-      console.warn(
-        `[Ask AI] Primary OpenAI (${OPENAI_COMPAT_ANALYSIS_MODEL}) failed; falling back to Google Gemini:`,
-        openAiErr instanceof Error ? openAiErr.message : openAiErr
-      );
-    }
-
-    // 2. Fallback: Google Gemini streaming via @google/genai
-    const geminiEngineLabel = 'Google Gemini fallback';
-    try {
-      const ai = getGeminiClient();
-      const geminiContents = conversation.map((m) => ({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      }));
-
-      const attempts = [
-        { model: GEMINI_MODEL, delayMs: 0 },
-        { model: GEMINI_FALLBACK_MODEL, delayMs: 800 },
-      ];
-
-      let lastErr: unknown;
-      for (const attempt of attempts) {
-        if (clientDisconnected) break;
-        if (attempt.delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, attempt.delayMs));
-        }
-        try {
-          const stream = await ai.models.generateContentStream({
-            model: attempt.model,
-            contents: geminiContents,
-            config: {
-              systemInstruction,
-            },
-          });
-
-          let sentMeta = false;
-          for await (const chunk of stream) {
-            if (clientDisconnected) break;
-            const text = chunk.text || '';
-            if (text) {
-              if (!sentMeta) {
-                sendSse({ type: 'meta', engineUsed: geminiEngineLabel });
-                sentMeta = true;
-              }
-              emittedAnyVisibleText = true;
-              sendSse({ type: 'delta', text });
-            }
-          }
-
-          if (emittedAnyVisibleText || clientDisconnected) {
-            break;
-          }
-          throw new Error('Gemini stream returned empty output.');
-        } catch (err) {
-          lastErr = err;
-          if (emittedAnyVisibleText || !isTransientGeminiError(err)) {
-            throw err;
-          }
-        }
-      }
-
-      if (!clientDisconnected) {
-        if (!emittedAnyVisibleText) {
-          throw lastErr || new Error('Gemini fallback produced no text.');
-        }
-        sendSse({ type: 'done', engineUsed: geminiEngineLabel });
-        res.end();
-      }
-    } catch (geminiErr) {
-      if (!clientDisconnected && !res.writableEnded) {
-        const mapped = formatGeminiError(geminiErr);
-        sendSse({
-          type: 'error',
-          message: mapped.message || 'Both OpenAI and Gemini fallback failed to respond.',
-        });
-        res.end();
-      }
-    }
+    })();
   });
 
   app.get('/plans/:filename', (req: Request, res: Response) => {

@@ -48,6 +48,7 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -89,7 +90,7 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isOpen, onClose]);
 
-  // Auto-scroll when new content streams in, unless user manually scrolled up
+  // Auto-scroll when new messages arrive, unless user manually scrolled up
   useEffect(() => {
     if (!isOpen || !shouldAutoScrollRef.current) return;
     const el = scrollContainerRef.current;
@@ -98,9 +99,15 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
     }
   }, [activeMessages, isOpen, isExpanded]);
 
-  // Abort any in-flight stream on unmount
+  // Abort any in-flight request on unmount
   useEffect(() => {
     return () => {
+      if (activeJobIdRef.current) {
+        void fetch(`/api/ask-ai/jobs/${encodeURIComponent(activeJobIdRef.current)}/cancel`, {
+          method: 'POST',
+        }).catch(() => {});
+        activeJobIdRef.current = null;
+      }
       abortControllerRef.current?.abort();
     };
   }, []);
@@ -113,6 +120,12 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
   }
 
   function stopStreaming() {
+    if (activeJobIdRef.current) {
+      void fetch(`/api/ask-ai/jobs/${encodeURIComponent(activeJobIdRef.current)}/cancel`, {
+        method: 'POST',
+      }).catch(() => {});
+      activeJobIdRef.current = null;
+    }
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
     setStreamingContextKey(null);
@@ -205,7 +218,7 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
     };
 
     try {
-      const response = await fetch('/api/ask-ai/stream', {
+      const response = await fetch('/api/ask-ai', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -217,89 +230,111 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
         signal: controller.signal,
       });
 
-      if (!response.ok || !response.body) {
-        let errMessage = `Ask AI request failed (HTTP ${response.status}).`;
-        try {
-          const errJson = (await response.json()) as { message?: string };
-          if (errJson?.message) errMessage = errJson.message;
-        } catch {
-          // Keep default message
-        }
+      const startJson = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        askAiJobId?: string;
+        message?: string;
+      };
+
+      if (!response.ok || !startJson.askAiJobId) {
         updateAssistantMessage((msg) => ({
           ...msg,
-          content: errMessage,
+          content: startJson.message || `Ask AI request failed (HTTP ${response.status}).`,
           isError: true,
         }));
         return;
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
-      let receivedAnyText = false;
+      const jobId = startJson.askAiJobId;
+      activeJobIdRef.current = jobId;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+      // Poll async job status matching Gen AI Analysis & Recommendations
+      const maxPollDurationMs = 315_000;
+      const pollStartedAt = Date.now();
+      let consecutivePollErrors = 0;
 
-        const events = buffer.split('\n\n');
-        buffer = events.pop() ?? '';
+      while (!controller.signal.aborted) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            controller.signal.removeEventListener('abort', onAbort);
+            resolve();
+          }, 1200);
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('Aborted', 'AbortError'));
+          };
+          controller.signal.addEventListener('abort', onAbort, { once: true });
+        });
 
-        for (const rawEvent of events) {
-          const dataLines = rawEvent
-            .split('\n')
-            .filter((line) => line.startsWith('data:'))
-            .map((line) => line.slice(5).trim());
-          if (dataLines.length === 0) continue;
-
-          const dataStr = dataLines.join('\n');
-          if (!dataStr || dataStr === '[DONE]') continue;
-
-          try {
-            const payload = JSON.parse(dataStr) as {
-              type?: 'meta' | 'delta' | 'done' | 'error';
-              text?: string;
-              engineUsed?: string;
-              message?: string;
-            };
-
-            if (payload.type === 'meta' && payload.engineUsed) {
-              updateAssistantMessage((msg) => ({ ...msg, engineUsed: payload.engineUsed }));
-            } else if (payload.type === 'delta' && typeof payload.text === 'string') {
-              receivedAnyText = true;
-              updateAssistantMessage((msg) => ({
-                ...msg,
-                content: msg.content + payload.text,
-              }));
-            } else if (payload.type === 'done') {
-              if (payload.engineUsed) {
-                updateAssistantMessage((msg) => ({ ...msg, engineUsed: payload.engineUsed }));
-              }
-            } else if (payload.type === 'error') {
-              updateAssistantMessage((msg) => ({
-                ...msg,
-                content:
-                  payload.message || 'Ask AI could not complete your request. Please retry.',
-                isError: true,
-              }));
-            }
-          } catch {
-            // Ignore malformed SSE chunk
-          }
+        if (Date.now() - pollStartedAt > maxPollDurationMs) {
+          updateAssistantMessage((msg) => ({
+            ...msg,
+            content: 'Ask AI timed out waiting for OpenAI to respond. Please retry.',
+            isError: true,
+          }));
+          return;
         }
-      }
 
-      if (!receivedAnyText) {
-        updateAssistantMessage((msg) =>
-          msg.content.trim()
-            ? msg
-            : {
-                ...msg,
-                content: 'No response was returned from the AI engine. Please try again.',
-                isError: true,
-              }
-        );
+        let pollRes: Response;
+        try {
+          pollRes = await fetch(`/api/ask-ai/jobs/${encodeURIComponent(jobId)}`, {
+            signal: controller.signal,
+          });
+        } catch (pollErr) {
+          if ((pollErr as Error)?.name === 'AbortError') throw pollErr;
+          consecutivePollErrors += 1;
+          if (consecutivePollErrors >= 5) {
+            throw pollErr;
+          }
+          continue;
+        }
+
+        const pollData = (await pollRes.json().catch(() => ({}))) as {
+          ok?: boolean;
+          status?: 'processing' | 'completed' | 'failed';
+          reply?: string;
+          engineUsed?: string;
+          error?: string;
+          message?: string;
+        };
+
+        if (!pollRes.ok) {
+          updateAssistantMessage((msg) => ({
+            ...msg,
+            content: pollData.message || `Ask AI status check failed (HTTP ${pollRes.status}).`,
+            isError: true,
+          }));
+          return;
+        }
+
+        consecutivePollErrors = 0;
+
+        if (pollData.status === 'completed') {
+          const finalReply = (pollData.reply || '').trim();
+          if (!finalReply) {
+            updateAssistantMessage((msg) => ({
+              ...msg,
+              content: 'No response was returned from OpenAI. Please try again.',
+              isError: true,
+            }));
+            return;
+          }
+          updateAssistantMessage((msg) => ({
+            ...msg,
+            content: finalReply,
+            engineUsed: pollData.engineUsed,
+          }));
+          return;
+        }
+
+        if (pollData.status === 'failed') {
+          updateAssistantMessage((msg) => ({
+            ...msg,
+            content: pollData.error || 'Ask AI could not complete your request. Please retry.',
+            isError: true,
+          }));
+          return;
+        }
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
@@ -324,6 +359,7 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
     } finally {
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
+        activeJobIdRef.current = null;
       }
       setStreamingContextKey((curr) => (curr === targetContextKey ? null : curr));
     }
@@ -465,7 +501,7 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
                 Grounded Q&amp;A on your active data
               </p>
               <p className="mt-1 text-xs leading-relaxed text-[#475569]">
-                Ask any follow-up question below. Responses stream directly from your fed{' '}
+                Ask any follow-up question below. Responses are generated directly from your fed{' '}
                 {context.scopeType === 'studio_transcript'
                   ? 'transcript'
                   : context.scopeType === 'single_analysis'
@@ -541,18 +577,18 @@ export function AskAiWidget({ isOpen, context, onClose }: AskAiWidgetProps) {
                 {msg.content ? (
                   <MarkdownRenderer markdown={msg.content} compact />
                 ) : (
-                  <div className="flex items-center gap-2 text-xs text-[#64748B]">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#E11D48]" aria-hidden="true" />
-                    <span>Analyzing context and streaming response...</span>
-                  </div>
-                )}
+                    <div className="flex items-center gap-2 text-xs text-[#64748B]">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#E11D48]" aria-hidden="true" />
+                      <span>Analyzing context with OpenAI...</span>
+                    </div>
+                  )}
 
-                {isLastAssistantStreaming && msg.content && (
-                  <div className="mt-2 inline-flex items-center gap-1.5 text-[11px] text-[#64748B]">
-                    <Loader2 className="h-3 w-3 animate-spin text-[#E11D48]" aria-hidden="true" />
-                    <span>Streaming...</span>
-                  </div>
-                )}
+                  {isLastAssistantStreaming && msg.content && (
+                    <div className="mt-2 inline-flex items-center gap-1.5 text-[11px] text-[#64748B]">
+                      <Loader2 className="h-3 w-3 animate-spin text-[#E11D48]" aria-hidden="true" />
+                      <span>Generating...</span>
+                    </div>
+                  )}
 
                 {!isLastAssistantStreaming && msg.content && (
                   <div className="mt-3 flex items-center justify-between gap-2 border-t border-[#F1F5F9] pt-2 text-[11px] text-[#64748B]">
